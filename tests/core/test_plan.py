@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlmesh.utils.metaprogramming import Executable
-from tests.core.test_table_diff import create_test_console, strip_ansi_codes
+from tests.core.test_table_diff import create_test_console
 import time_machine
 from pytest_mock.plugin import MockerFixture
 from sqlglot import parse_one
@@ -41,7 +41,8 @@ from sqlmesh.utils.date import (
     to_timestamp,
     yesterday_ds,
 )
-from sqlmesh.utils.errors import PlanError
+from sqlmesh.utils.errors import PlanError, NoChangesPlanError
+from sqlmesh.utils.rich import strip_ansi_codes
 
 
 def test_forward_only_plan_sets_version(make_snapshot, mocker: MockerFixture):
@@ -743,6 +744,7 @@ def test_missing_intervals_lookback(make_snapshot, mocker: MockerFixture):
         end_bounded=False,
         ensure_finalized_snapshots=False,
         interval_end_per_model=None,
+        explain=False,
     )
 
     assert not plan.missing_intervals
@@ -3094,3 +3096,196 @@ def test_user_provided_flags(sushi_context: Context):
         context_diff,
     ).build()
     assert plan_builder.user_provided_flags == None
+
+
+@time_machine.travel(now())
+@pytest.mark.parametrize(
+    "input,output",
+    [
+        # execution_time, start, end
+        (
+            # no execution time, start or end
+            (None, None, None),
+            # execution time defaults to now()
+            # start defaults to 1 day before execution time
+            # end defaults to execution_time
+            (now(), yesterday_ds(), now()),
+        ),
+        (
+            # fixed execution time, no start, no end
+            ("2020-01-05", None, None),
+            # execution time set to 2020-01-05
+            # start defaults to 1 day before execution time
+            # end defaults to execution time
+            ("2020-01-05", "2020-01-04", "2020-01-05"),
+        ),
+        (
+            # fixed execution time, relative start, no end
+            ("2020-01-05", "2 days ago", None),
+            # execution time set to 2020-01-05
+            # start relative to execution time
+            # end defaults to execution time
+            ("2020-01-05", "2020-01-03", "2020-01-05"),
+        ),
+        (
+            # fixed execution time, relative start, relative end
+            ("2020-01-05", "2 days ago", "1 day ago"),
+            # execution time set to 2020-01-05
+            # start relative to execution time
+            # end relative to execution time
+            ("2020-01-05", "2020-01-03", "2020-01-04"),
+        ),
+        (
+            # fixed execution time, fixed start, fixed end
+            ("2020-01-05", "2020-01-01", "2020-01-05"),
+            # fixed dates are all in the valid range
+            ("2020-01-05", "2020-01-01", "2020-01-05"),
+        ),
+        (
+            # fixed execution time, fixed start, fixed end
+            ("2020-01-05", "2020-01-05", "2020-01-01"),
+            # Error because start is after end
+            r"Plan end date.*must be after the plan start date",
+        ),
+        (
+            # fixed execution time, relative start, fixed end beyond fixed execution time
+            ("2020-01-05", "2 days ago", "2021-01-01"),
+            # Error because end is set to 2021-01-01 which is after the execution time
+            r"Plan end date.*cannot be in the future",
+        ),
+    ],
+)
+def test_plan_dates_relative_to_execution_time(
+    input: t.Tuple[t.Optional[str], ...],
+    output: t.Union[str, t.Tuple[t.Optional[str], ...]],
+    make_snapshot: t.Callable,
+):
+    snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 1, ds"), dialect="duckdb")
+    )
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added={snapshot_a.snapshot_id},
+        removed_snapshots={},
+        modified_snapshots={},
+        snapshots={},
+        new_snapshots={snapshot_a.snapshot_id: snapshot_a},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+    )
+
+    input_execution_time, input_start, input_end = input
+
+    def _build_plan() -> Plan:
+        return PlanBuilder(
+            context_diff,
+            start=input_start,
+            end=input_end,
+            execution_time=input_execution_time,
+            is_dev=True,
+        ).build()
+
+    if isinstance(output, str):
+        with pytest.raises(PlanError, match=output):
+            _build_plan()
+    else:
+        output_execution_time, output_start, output_end = output
+
+        plan = _build_plan()
+        assert to_datetime(plan.start) == to_datetime(output_start)
+        assert to_datetime(plan.end) == to_datetime(output_end)
+        assert to_datetime(plan.execution_time) == to_datetime(output_execution_time)
+
+
+def test_environment_statements_change_allows_dev_environment_creation(make_snapshot):
+    snapshot = make_snapshot(
+        SqlModel(
+            name="test_model",
+            dialect="duckdb",
+            query=parse_one("select 1, ds"),
+            kind=dict(name=ModelKindName.INCREMENTAL_BY_TIME_RANGE, time_column="ds"),
+        )
+    )
+
+    # First context diff of a new 'dev' environment without environment statements
+    context_diff_no_statements = ContextDiff(
+        environment="dev",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={},
+        snapshots={snapshot.snapshot_id: snapshot},
+        new_snapshots={},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids={snapshot.snapshot_id},
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+        previous_environment_statements=[],
+    )
+
+    # Should fail because no changes
+    plan_builder = PlanBuilder(
+        context_diff_no_statements,
+        is_dev=True,
+    )
+
+    with pytest.raises(NoChangesPlanError, match="Creating a new environment requires a change"):
+        plan_builder.build()
+
+    # Now create context diff with environment statements
+    environment_statements = [
+        EnvironmentStatements(
+            before_all=["CREATE TABLE IF NOT EXISTS test_table (id INT)"],
+            after_all=[],
+            python_env={},
+            jinja_macros=None,
+        )
+    ]
+
+    context_diff_with_statements = ContextDiff(
+        environment="dev",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={},
+        snapshots={snapshot.snapshot_id: snapshot},
+        new_snapshots={},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids={snapshot.snapshot_id},
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=environment_statements,
+        previous_environment_statements=[],
+    )
+
+    # Should succeed because there are environment statements changes
+    plan_builder_with_statements = PlanBuilder(
+        context_diff_with_statements,
+        is_dev=True,
+    )
+
+    # Test that allows creating a dev environment without other changes
+    plan = plan_builder_with_statements.build()
+    assert plan is not None
+    assert plan.context_diff.has_environment_statements_changes
+    assert plan.context_diff.environment_statements == environment_statements

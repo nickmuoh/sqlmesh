@@ -6,12 +6,14 @@ from collections import Counter
 from datetime import timedelta
 from unittest import mock
 from unittest.mock import patch
-
+import logging
 import os
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: TID253
+import pandas as pd  # noqa: TID253
 import pytest
+from pytest import MonkeyPatch
 from pathlib import Path
+from sqlmesh.core.console import set_console, get_console, TerminalConsole
 from sqlmesh.core.config.naming import NameInferenceConfig
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 import time_machine
@@ -23,7 +25,7 @@ from IPython.utils.capture import capture_output
 
 
 from sqlmesh import CustomMaterialization
-from sqlmesh.cli.example_project import init_example_project
+from sqlmesh.cli.project_init import init_example_project
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.config import (
@@ -33,9 +35,11 @@ from sqlmesh.core.config import (
     ModelDefaultsConfig,
     DuckDBConnectionConfig,
 )
+from sqlmesh.core.config.common import EnvironmentSuffixTarget
 from sqlmesh.core.console import Console, get_console
 from sqlmesh.core.context import Context
 from sqlmesh.core.config.categorizer import CategorizerConfig
+from sqlmesh.core.config.plan import PlanConfig
 from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.macros import macro
@@ -63,6 +67,7 @@ from sqlmesh.core.snapshot import (
     SnapshotInfoLike,
     SnapshotTableInfo,
 )
+from sqlmesh.utils import CorrelationId
 from sqlmesh.utils.date import TimeLike, now, to_date, to_datetime, to_timestamp
 from sqlmesh.utils.errors import NoChangesPlanError, SQLMeshError, PlanError, ConfigError
 from sqlmesh.utils.pydantic import validate_string
@@ -1133,7 +1138,7 @@ def test_non_breaking_change_after_forward_only_in_dev(
     init_and_plan_context: t.Callable, has_view_binding: bool
 ):
     context, plan = init_and_plan_context("examples/sushi")
-    context.snapshot_evaluator.adapter.HAS_VIEW_BINDING = has_view_binding
+    context.snapshot_evaluator().adapter.HAS_VIEW_BINDING = has_view_binding
     context.apply(plan)
 
     model = context.get_model("sushi.waiter_revenue_by_day")
@@ -4001,7 +4006,7 @@ def test_run_auto_restatement_failure(init_and_plan_context: t.Callable):
 
 
 def test_plan_twice_with_star_macro_yields_no_diff(tmp_path: Path):
-    init_example_project(tmp_path, dialect="duckdb")
+    init_example_project(tmp_path, engine_type="duckdb")
 
     star_model_definition = """
         MODEL (
@@ -4328,6 +4333,49 @@ def test_indirect_non_breaking_view_is_updated_with_new_table_references(
     assert context.get_model("sushi.top_waiters").kind.is_view
     row_num = context.engine_adapter.fetchone(f"SELECT COUNT(*) FROM sushi.top_waiters")[0]
     assert row_num > 0
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_plan_explain(init_and_plan_context: t.Callable):
+    old_console = get_console()
+    set_console(TerminalConsole())
+
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+
+    waiter_revenue_by_day_model = context.get_model("sushi.waiter_revenue_by_day")
+    waiter_revenue_by_day_model = add_projection_to_model(
+        t.cast(SqlModel, waiter_revenue_by_day_model)
+    )
+    context.upsert_model(waiter_revenue_by_day_model)
+
+    waiter_revenue_by_day_snapshot = context.get_snapshot(waiter_revenue_by_day_model.name)
+    top_waiters_snapshot = context.get_snapshot("sushi.top_waiters")
+
+    common_kwargs = dict(skip_tests=True, no_prompts=True, explain=True)
+
+    # For now just making sure the plan doesn't error
+    context.plan("dev", **common_kwargs)
+    context.plan("dev", **common_kwargs, skip_backfill=True)
+    context.plan("dev", **common_kwargs, empty_backfill=True)
+    context.plan("dev", **common_kwargs, forward_only=True, enable_preview=True)
+    context.plan("prod", **common_kwargs)
+    context.plan("prod", **common_kwargs, forward_only=True)
+    context.plan("prod", **common_kwargs, restate_models=[waiter_revenue_by_day_model.name])
+
+    set_console(old_console)
+
+    # Make sure that the now changes were actually applied
+    for target_env in ("dev", "prod"):
+        plan = context.plan_builder(target_env, skip_tests=True).build()
+        assert plan.has_changes
+        assert plan.missing_intervals
+        assert plan.directly_modified == {waiter_revenue_by_day_snapshot.snapshot_id}
+        assert len(plan.new_snapshots) == 2
+        assert {s.snapshot_id for s in plan.new_snapshots} == {
+            waiter_revenue_by_day_snapshot.snapshot_id,
+            top_waiters_snapshot.snapshot_id,
+        }
 
 
 @time_machine.travel("2023-01-08 15:00:00 UTC")
@@ -5214,7 +5262,9 @@ def test_invalidating_environment(sushi_context: Context):
 
 
 def test_environment_suffix_target_table(init_and_plan_context: t.Callable):
-    context, plan = init_and_plan_context("examples/sushi", config="environment_suffix_config")
+    context, plan = init_and_plan_context(
+        "examples/sushi", config="environment_suffix_table_config"
+    )
     context.apply(plan)
     metadata = DuckDBMetadata.from_context(context)
     environments_schemas = {"sushi"}
@@ -5248,6 +5298,116 @@ def test_environment_suffix_target_table(init_and_plan_context: t.Callable):
     assert {x.sql(dialect="duckdb") for x in prod_views} - {
         x.sql(dialect="duckdb") for x in views_after_janitor
     } == set()
+
+
+def test_environment_suffix_target_catalog(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        default_connection=DuckDBConnectionConfig(catalogs={"main_warehouse": ":memory:"}),
+        environment_suffix_target=EnvironmentSuffixTarget.CATALOG,
+    )
+
+    assert config.default_connection
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+
+    (models_dir / "model.sql").write_text("""
+    MODEL (
+        name example_schema.test_model,
+        kind FULL
+    );
+
+    SELECT '1' as a""")
+
+    (models_dir / "fqn_model.sql").write_text("""
+    MODEL (
+        name memory.example_fqn_schema.test_model_fqn,
+        kind FULL
+    );
+
+    SELECT '1' as a""")
+
+    ctx = Context(config=config, paths=tmp_path)
+
+    metadata = DuckDBMetadata.from_context(ctx)
+    assert ctx.default_catalog == "main_warehouse"
+    assert metadata.catalogs == {"main_warehouse", "memory"}
+
+    ctx.plan(auto_apply=True)
+
+    # prod should go to the default catalog and not be overridden to a catalog called 'prod'
+    assert (
+        ctx.engine_adapter.fetchone("select * from main_warehouse.example_schema.test_model")[0]  # type: ignore
+        == "1"
+    )
+    assert (
+        ctx.engine_adapter.fetchone("select * from memory.example_fqn_schema.test_model_fqn")[0]  # type: ignore
+        == "1"
+    )
+    assert metadata.catalogs == {"main_warehouse", "memory"}
+    assert metadata.schemas_in_catalog("main_warehouse") == [
+        "example_schema",
+        "sqlmesh__example_schema",
+    ]
+    assert metadata.schemas_in_catalog("memory") == [
+        "example_fqn_schema",
+        "sqlmesh__example_fqn_schema",
+    ]
+
+    # dev should be overridden to go to a catalogs called 'main_warehouse__dev' and 'memory__dev'
+    ctx.plan(environment="dev", include_unmodified=True, auto_apply=True)
+    assert (
+        ctx.engine_adapter.fetchone("select * from main_warehouse__dev.example_schema.test_model")[
+            0
+        ]  # type: ignore
+        == "1"
+    )
+    assert (
+        ctx.engine_adapter.fetchone("select * from memory__dev.example_fqn_schema.test_model_fqn")[
+            0
+        ]  # type: ignore
+        == "1"
+    )
+    assert metadata.catalogs == {"main_warehouse", "main_warehouse__dev", "memory", "memory__dev"}
+
+    # schemas in dev envs should match prod and not have a suffix
+    assert metadata.schemas_in_catalog("main_warehouse") == [
+        "example_schema",
+        "sqlmesh__example_schema",
+    ]
+    assert metadata.schemas_in_catalog("main_warehouse__dev") == ["example_schema"]
+    assert metadata.schemas_in_catalog("memory") == [
+        "example_fqn_schema",
+        "sqlmesh__example_fqn_schema",
+    ]
+    assert metadata.schemas_in_catalog("memory__dev") == ["example_fqn_schema"]
+
+    ctx.invalidate_environment("dev", sync=True)
+
+    # dev catalogs cleaned up
+    assert metadata.catalogs == {"main_warehouse", "memory"}
+
+    # prod catalogs still contain physical layer and views still work
+    assert metadata.schemas_in_catalog("main_warehouse") == [
+        "example_schema",
+        "sqlmesh__example_schema",
+    ]
+    assert metadata.schemas_in_catalog("memory") == [
+        "example_fqn_schema",
+        "sqlmesh__example_fqn_schema",
+    ]
+
+    assert (
+        ctx.engine_adapter.fetchone("select * from main_warehouse.example_schema.test_model")[0]  # type: ignore
+        == "1"
+    )
+    assert (
+        ctx.engine_adapter.fetchone("select * from memory.example_fqn_schema.test_model_fqn")[0]  # type: ignore
+        == "1"
+    )
 
 
 def test_environment_catalog_mapping(init_and_plan_context: t.Callable):
@@ -5399,7 +5559,7 @@ def test_python_model_default_kind_change(init_and_plan_context: t.Callable):
 
     # note: we deliberately dont specify a Kind here to allow the defaults to be picked up
     python_model_file = """import typing as t
-import pandas as pd
+import pandas as pd  # noqa: TID253
 from sqlmesh import ExecutionContext, model
 
 @model(
@@ -6208,3 +6368,455 @@ def test_render_path_instead_of_model(tmp_path: Path):
 
     # Case 3: Render the model successfully
     assert ctx.render("test_model").sql() == 'SELECT 1 AS "col"'
+
+
+@use_terminal_console
+def test_plan_always_recreate_environment(tmp_path: Path):
+    def plan_with_output(ctx: Context, environment: str):
+        with patch.object(logger, "info") as mock_logger:
+            with capture_output() as output:
+                ctx.load()
+                ctx.plan(environment, no_prompts=True, auto_apply=True)
+
+            # Facade logs info "Promoting environment {environment}"
+            assert mock_logger.call_args[0][1] == environment
+
+        return output
+
+    models_dir = tmp_path / "models"
+
+    logger = logging.getLogger("sqlmesh.core.state_sync.db.facade")
+
+    create_temp_file(
+        tmp_path, models_dir / "a.sql", "MODEL (name test.a, kind FULL); SELECT 1 AS col"
+    )
+
+    config = Config(plan=PlanConfig(always_recreate_environment=True))
+    ctx = Context(paths=[tmp_path], config=config)
+
+    # Case 1: Neither prod nor dev exists, so dev is initialized
+    output = plan_with_output(ctx, "dev")
+
+    assert """`dev` environment will be initialized""" in output.stdout
+
+    # Case 2: Prod does not exist, so dev is updated
+    create_temp_file(
+        tmp_path, models_dir / "a.sql", "MODEL (name test.a, kind FULL); SELECT 5 AS col"
+    )
+
+    output = plan_with_output(ctx, "dev")
+    assert "`dev` environment will be initialized" in output.stdout
+
+    # Case 3: Prod is initialized, so plan comparisons moving forward should be against prod
+    output = plan_with_output(ctx, "prod")
+    assert "`prod` environment will be initialized" in output.stdout
+
+    # Case 4: Dev is updated with a breaking change. Prod exists now so plan comparisons moving forward should be against prod
+    create_temp_file(
+        tmp_path, models_dir / "a.sql", "MODEL (name test.a, kind FULL); SELECT 10 AS col"
+    )
+    ctx.load()
+
+    plan = ctx.plan_builder("dev").build()
+
+    assert (
+        next(iter(plan.context_diff.snapshots.values())).change_category
+        == SnapshotChangeCategory.BREAKING
+    )
+
+    output = plan_with_output(ctx, "dev")
+    assert "New environment `dev` will be created from `prod`" in output.stdout
+    assert "Differences from the `prod` environment" in output.stdout
+
+    # Case 5: Dev is updated with a metadata change, but comparison against prod shows both the previous and the current changes
+    # so it's still classified as a breaking change
+    create_temp_file(
+        tmp_path,
+        models_dir / "a.sql",
+        "MODEL (name test.a, kind FULL, owner 'test'); SELECT 10 AS col",
+    )
+    ctx.load()
+
+    plan = ctx.plan_builder("dev").build()
+
+    assert (
+        next(iter(plan.context_diff.snapshots.values())).change_category
+        == SnapshotChangeCategory.BREAKING
+    )
+
+    output = plan_with_output(ctx, "dev")
+    assert "New environment `dev` will be created from `prod`" in output.stdout
+    assert "Differences from the `prod` environment" in output.stdout
+
+    assert (
+        """MODEL (                                                                        
+   name test.a,                                                                 
++  owner test,                                                                  
+   kind FULL                                                                    
+ )                                                                              
+ SELECT                                                                         
+-  5 AS col                                                                     
++  10 AS col"""
+        in output.stdout
+    )
+
+    # Case 6: Ensure that target environment and create_from environment are not the same
+    output = plan_with_output(ctx, "prod")
+    assert not "New environment `prod` will be created from `prod`" in output.stdout
+
+    # Case 7: Check that we can still run Context::diff() against any environment
+    for environment in ["dev", "prod"]:
+        context_diff = ctx._context_diff(environment)
+        assert context_diff.environment == environment
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_scd_type_2_restatement(init_and_plan_context: t.Callable):
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+
+    raw_employee_status = d.parse("""
+    MODEL (
+        name memory.hr_system.raw_employee_status,
+        kind FULL
+    );
+
+    SELECT
+        1001 AS employee_id,
+        'engineering' AS department,
+        'EMEA' AS region,
+        '2023-01-08 15:00:00 UTC' AS last_modified;
+    """)
+
+    # Create SCD Type 2 model for employee history tracking
+    employee_history = d.parse("""
+    MODEL (
+        name memory.hr_system.employee_history,
+        kind SCD_TYPE_2_BY_TIME (
+            unique_key employee_id,
+            updated_at_name last_modified,
+            disable_restatement false
+        ),
+        owner hr_analytics,
+        cron '*/5 * * * *',
+        grain employee_id,
+        description 'Historical tracking of employee status changes'
+    );
+
+    SELECT
+        employee_id::INT AS employee_id,
+        department::TEXT AS department,
+        region::TEXT AS region,
+        last_modified AS last_modified
+    FROM
+        memory.hr_system.raw_employee_status;
+    """)
+
+    raw_employee_status_model = load_sql_based_model(raw_employee_status)
+    employee_history_model = load_sql_based_model(employee_history)
+    context.upsert_model(raw_employee_status_model)
+    context.upsert_model(employee_history_model)
+
+    # Initial plan and apply
+    plan = context.plan_builder("prod", skip_tests=True).build()
+    context.apply(plan)
+
+    query = "SELECT employee_id, department, region, valid_from, valid_to FROM memory.hr_system.employee_history ORDER BY employee_id, valid_from"
+    initial_data = context.engine_adapter.fetchdf(query)
+
+    assert len(initial_data) == 1
+    assert initial_data["valid_to"].isna().all()
+    assert initial_data["department"].tolist() == ["engineering"]
+    assert initial_data["region"].tolist() == ["EMEA"]
+
+    # Apply a future plan with source changes
+    with time_machine.travel("2023-01-08 15:10:00 UTC"):
+        # Update source model, employee 1001 changed region
+        raw_employee_status_v2 = d.parse("""
+        MODEL (
+            name memory.hr_system.raw_employee_status,
+            kind FULL
+        );
+
+        SELECT
+            1001 AS employee_id,
+            'engineering' AS department,
+            'AMER' AS region,
+            '2023-01-08 15:10:00 UTC' AS last_modified;
+        """)
+        raw_employee_status_v2_model = load_sql_based_model(raw_employee_status_v2)
+        context.upsert_model(raw_employee_status_v2_model)
+        context.plan(
+            auto_apply=True, no_prompts=True, categorizer_config=CategorizerConfig.all_full()
+        )
+
+    with time_machine.travel("2023-01-08 15:20:00 UTC"):
+        context.run()
+        data_after_change = context.engine_adapter.fetchdf(query)
+
+        # Validate the SCD2 history for employee 1001
+        assert len(data_after_change) == 2
+        assert data_after_change.iloc[0]["employee_id"] == 1001
+        assert data_after_change.iloc[0]["department"] == "engineering"
+        assert data_after_change.iloc[0]["region"] == "EMEA"
+        assert str(data_after_change.iloc[0]["valid_from"]) == "1970-01-01 00:00:00"
+        assert str(data_after_change.iloc[0]["valid_to"]) == "2023-01-08 15:10:00"
+        assert data_after_change.iloc[1]["employee_id"] == 1001
+        assert data_after_change.iloc[1]["department"] == "engineering"
+        assert data_after_change.iloc[1]["region"] == "AMER"
+        assert str(data_after_change.iloc[1]["valid_from"]) == "2023-01-08 15:10:00"
+        assert pd.isna(data_after_change.iloc[1]["valid_to"])
+
+        # Update source model, employee 1001 changed region again and department
+        raw_employee_status_v2 = d.parse("""
+        MODEL (
+            name memory.hr_system.raw_employee_status,
+            kind FULL
+        );
+
+        SELECT
+            1001 AS employee_id,
+            'sales' AS department,
+            'ANZ' AS region,
+            '2023-01-08 15:26:00 UTC' AS last_modified;
+        """)
+        raw_employee_status_v2_model = load_sql_based_model(raw_employee_status_v2)
+        context.upsert_model(raw_employee_status_v2_model)
+        context.plan(
+            auto_apply=True, no_prompts=True, categorizer_config=CategorizerConfig.all_full()
+        )
+
+    with time_machine.travel("2023-01-08 15:35:00 UTC"):
+        context.run()
+        data_after_change = context.engine_adapter.fetchdf(query)
+
+        # Validate the SCD2 history for employee 1001 after second change
+        assert len(data_after_change) == 3
+        assert data_after_change.iloc[0]["employee_id"] == 1001
+        assert data_after_change.iloc[0]["department"] == "engineering"
+        assert data_after_change.iloc[0]["region"] == "EMEA"
+        assert str(data_after_change.iloc[0]["valid_from"]) == "1970-01-01 00:00:00"
+        assert str(data_after_change.iloc[0]["valid_to"]) == "2023-01-08 15:10:00"
+        assert data_after_change.iloc[1]["employee_id"] == 1001
+        assert data_after_change.iloc[1]["department"] == "engineering"
+        assert data_after_change.iloc[1]["region"] == "AMER"
+        assert str(data_after_change.iloc[1]["valid_from"]) == "2023-01-08 15:10:00"
+        assert str(data_after_change.iloc[1]["valid_to"]) == "2023-01-08 15:26:00"
+        assert data_after_change.iloc[2]["employee_id"] == 1001
+        assert data_after_change.iloc[2]["department"] == "sales"
+        assert data_after_change.iloc[2]["region"] == "ANZ"
+        assert str(data_after_change.iloc[2]["valid_from"]) == "2023-01-08 15:26:00"
+        assert pd.isna(data_after_change.iloc[2]["valid_to"])
+
+    # Now test restatement cleanup by restating from 15:10 (first change)
+    with time_machine.travel("2023-01-08 15:38:00 UTC"):
+        plan = context.plan_builder(
+            "prod",
+            skip_tests=True,
+            restate_models=["memory.hr_system.employee_history"],
+            start="2023-01-08 15:09:00",
+        ).build()
+        context.apply(plan)
+        restated_data = context.engine_adapter.fetchdf(query)
+
+        # Validate the SCD2 history after restatement
+        assert len(restated_data) == 2
+        assert restated_data.iloc[0]["employee_id"] == 1001
+        assert restated_data.iloc[0]["department"] == "engineering"
+        assert restated_data.iloc[0]["region"] == "EMEA"
+        assert str(restated_data.iloc[0]["valid_from"]) == "1970-01-01 00:00:00"
+        assert str(restated_data.iloc[0]["valid_to"]) == "2023-01-08 15:26:00"
+        assert restated_data.iloc[1]["employee_id"] == 1001
+        assert restated_data.iloc[1]["department"] == "sales"
+        assert restated_data.iloc[1]["region"] == "ANZ"
+        assert str(restated_data.iloc[1]["valid_from"]) == "2023-01-08 15:26:00"
+        assert pd.isna(restated_data.iloc[1]["valid_to"])
+
+
+@time_machine.travel("2020-01-01 00:00:00 UTC")
+def test_scd_type_2_full_restatement_no_start_date(init_and_plan_context: t.Callable):
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+
+    # Initial product catalog of 3 products
+    raw_products = d.parse("""
+    MODEL (
+        name memory.store.raw_products,
+        kind FULL
+    );
+
+    SELECT * FROM VALUES
+        (101, 'Laptop Pro', 1299.99, 'Electronics', '2020-01-01 00:00:00'::TIMESTAMP),
+        (102, 'Wireless Mouse', 49.99, 'Electronics', '2020-01-01 00:00:00'::TIMESTAMP),
+        (103, 'Office Chair', 199.99, 'Furniture', '2020-01-01 00:00:00'::TIMESTAMP)
+    AS t(product_id, product_name, price, category, last_updated);
+    """)
+
+    # SCD Type 2 model for product history tracking
+    product_history = d.parse("""
+    MODEL (
+        name memory.store.product_history,
+        kind SCD_TYPE_2_BY_TIME (
+            unique_key product_id,
+            updated_at_name last_updated,
+            disable_restatement false
+        ),
+        owner catalog_team,
+        cron '0 */6 * * *',
+        grain product_id,
+        description 'Product catalog change history'
+    );
+
+    SELECT
+        product_id::INT AS product_id,
+        product_name::TEXT AS product_name,
+        price::DECIMAL(10,2) AS price,
+        category::TEXT AS category,
+        last_updated AS last_updated
+    FROM
+        memory.store.raw_products;
+    """)
+
+    raw_products_model = load_sql_based_model(raw_products)
+    product_history_model = load_sql_based_model(product_history)
+    context.upsert_model(raw_products_model)
+    context.upsert_model(product_history_model)
+
+    # Initial plan and apply
+    plan = context.plan_builder("prod", skip_tests=True).build()
+    context.apply(plan)
+
+    query = "SELECT product_id, product_name, price, category, last_updated, valid_from, valid_to FROM memory.store.product_history ORDER BY product_id, valid_from"
+    initial_data = context.engine_adapter.fetchdf(query)
+
+    # Validate initial state of 3 products all active
+    assert len(initial_data) == 3
+    assert initial_data["valid_to"].isna().all()
+    initial_product_names = set(initial_data["product_name"].tolist())
+    assert initial_product_names == {"Laptop Pro", "Wireless Mouse", "Office Chair"}
+
+    # Price update and category change
+    with time_machine.travel("2020-01-15 12:00:00 UTC"):
+        raw_products_v2 = d.parse("""
+        MODEL (
+            name memory.store.raw_products,
+            kind FULL
+        );
+
+        SELECT * FROM VALUES
+            (101, 'Laptop Pro', 1199.99, 'Electronics', '2020-01-15 00:00:00'::TIMESTAMP),
+            (102, 'Wireless Mouse', 49.99, 'Electronics', '2020-01-01 00:00:00'::TIMESTAMP),
+            (103, 'Ergonomic Office Chair', 229.99, 'Office Furniture', '2020-01-15 00:00:00'::TIMESTAMP)
+        AS t(product_id, product_name, price, category, last_updated);
+        """)
+        raw_products_v2_model = load_sql_based_model(raw_products_v2)
+        context.upsert_model(raw_products_v2_model)
+        context.plan(
+            auto_apply=True, no_prompts=True, categorizer_config=CategorizerConfig.all_full()
+        )
+        context.run()
+
+        data_after_first_change = context.engine_adapter.fetchdf(query)
+
+        # Should have 5 records (3 original closed,  2 new activε, 1 unchanged)
+        assert len(data_after_first_change) == 5
+
+    # Second change
+    with time_machine.travel("2020-02-01 10:00:00 UTC"):
+        raw_products_v3 = d.parse("""
+        MODEL (
+            name memory.store.raw_products,
+            kind FULL
+        );
+
+        SELECT * FROM VALUES
+            (101, 'Laptop Pro Max', 1399.99, 'Electronics', '2020-02-01 00:00:00'::TIMESTAMP),
+            (103, 'Ergonomic Office Chair', 229.99, 'Office Furniture', '2020-01-15 00:00:00'::TIMESTAMP),
+            (102, 'Wireless Mouse', 49.99, 'Electronics', '2020-01-01 00:00:00'::TIMESTAMP)
+        AS t(product_id, product_name, price, category, last_updated);
+        """)
+        raw_products_v3_model = load_sql_based_model(raw_products_v3)
+        context.upsert_model(raw_products_v3_model)
+        context.plan(
+            auto_apply=True, no_prompts=True, categorizer_config=CategorizerConfig.all_full()
+        )
+        context.run()
+        data_after_second_change = context.engine_adapter.fetchdf(query)
+        assert len(data_after_second_change) == 6
+
+    # Store the current state before full restatement
+    data_before_full_restatement = data_after_second_change.copy()
+
+    # Perform full restatement (no start date provided)
+    with time_machine.travel("2020-02-01 15:00:00 UTC"):
+        plan = context.plan_builder(
+            "prod", skip_tests=True, restate_models=["memory.store.product_history"]
+        ).build()
+        context.apply(plan)
+        data_after_full_restatement = context.engine_adapter.fetchdf(query)
+        assert len(data_after_full_restatement) == 3
+
+        # Check that all currently active products before restatement are still active after restatement
+        active_before = data_before_full_restatement[
+            data_before_full_restatement["valid_to"].isna()
+        ]
+        active_after = data_after_full_restatement
+        assert set(active_before["product_id"]) == set(active_after["product_id"])
+
+        expected_products = {
+            101: {
+                "product_name": "Laptop Pro Max",
+                "price": 1399.99,
+                "category": "Electronics",
+                "last_updated": "2020-02-01",
+            },
+            102: {
+                "product_name": "Wireless Mouse",
+                "price": 49.99,
+                "category": "Electronics",
+                "last_updated": "2020-01-01",
+            },
+            103: {
+                "product_name": "Ergonomic Office Chair",
+                "price": 229.99,
+                "category": "Office Furniture",
+                "last_updated": "2020-01-15",
+            },
+        }
+        for _, row in data_after_full_restatement.iterrows():
+            pid = row["product_id"]
+            assert pid in expected_products
+            expected = expected_products[pid]
+            assert row["product_name"] == expected["product_name"]
+            assert float(row["price"]) == expected["price"]
+            assert row["category"] == expected["category"]
+
+            # valid_from should be the epoch, valid_to should be NaT
+            assert str(row["valid_from"]) == "1970-01-01 00:00:00"
+            assert pd.isna(row["valid_to"])
+
+
+def test_plan_evaluator_correlation_id(tmp_path: Path):
+    def _correlation_id_in_sqls(correlation_id: CorrelationId, mock_logger):
+        sqls = [call[0][0] for call in mock_logger.call_args_list]
+        return any(f"/* {correlation_id} */" in sql for sql in sqls)
+
+    create_temp_file(
+        tmp_path, Path("models") / "test.sql", "MODEL (name test.a, kind FULL); SELECT 1 AS col"
+    )
+
+    # Case 1: Ensure that the correlation id (plan_id) is included in the SQL
+    with mock.patch("sqlmesh.core.engine_adapter.base.EngineAdapter._log_sql") as mock_logger:
+        ctx = Context(paths=[tmp_path], config=Config())
+        plan = ctx.plan(auto_apply=True, no_prompts=True)
+
+    correlation_id = CorrelationId.from_plan_id(plan.plan_id)
+    assert str(correlation_id) == f"SQLMESH_PLAN: {plan.plan_id}"
+
+    assert _correlation_id_in_sqls(correlation_id, mock_logger)
+
+    # Case 2: Ensure that the previous correlation id is not included in the SQL for other operations
+    with mock.patch("sqlmesh.core.engine_adapter.base.EngineAdapter._log_sql") as mock_logger:
+        ctx.snapshot_evaluator().adapter.execute("SELECT 1")
+
+    assert not _correlation_id_in_sqls(correlation_id, mock_logger)

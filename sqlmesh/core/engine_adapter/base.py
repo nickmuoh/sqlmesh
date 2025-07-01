@@ -16,7 +16,6 @@ import sys
 import typing as t
 from functools import partial
 
-import pandas as pd
 from sqlglot import Dialect, exp
 from sqlglot.errors import ErrorLevel
 from sqlglot.helper import ensure_list
@@ -40,7 +39,7 @@ from sqlmesh.core.engine_adapter.shared import (
 )
 from sqlmesh.core.model.kind import TimeColumn
 from sqlmesh.core.schema_diff import SchemaDiffer
-from sqlmesh.utils import columns_to_types_all_known, random_id
+from sqlmesh.utils import columns_to_types_all_known, random_id, CorrelationId
 from sqlmesh.utils.connection_pool import create_connection_pool, ConnectionPool
 from sqlmesh.utils.date import TimeLike, make_inclusive, to_time_column
 from sqlmesh.utils.errors import (
@@ -51,6 +50,8 @@ from sqlmesh.utils.errors import (
 from sqlmesh.utils.pandas import columns_to_types_from_df
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlmesh.core._typing import SchemaName, SessionProperties, TableName
     from sqlmesh.core.engine_adapter._typing import (
         BigframeSession,
@@ -100,6 +101,7 @@ class EngineAdapter:
     SUPPORTS_VIEW_SCHEMA = True
     SUPPORTS_CLONING = False
     SUPPORTS_MANAGED_MODELS = False
+    SUPPORTS_CREATE_DROP_CATALOG = False
     SCHEMA_DIFFER = SchemaDiffer()
     SUPPORTS_TUPLE_IN = True
     HAS_VIEW_BINDING = False
@@ -121,6 +123,7 @@ class EngineAdapter:
         pre_ping: bool = False,
         pretty_sql: bool = False,
         shared_connection: bool = False,
+        correlation_id: t.Optional[CorrelationId] = None,
         **kwargs: t.Any,
     ):
         self.dialect = dialect.lower() or self.DIALECT
@@ -142,19 +145,21 @@ class EngineAdapter:
         self._pre_ping = pre_ping
         self._pretty_sql = pretty_sql
         self._multithreaded = multithreaded
+        self.correlation_id = correlation_id
 
-    def with_log_level(self, level: int) -> EngineAdapter:
+    def with_settings(self, log_level: int, **kwargs: t.Any) -> EngineAdapter:
         adapter = self.__class__(
             self._connection_pool,
             dialect=self.dialect,
             sql_gen_kwargs=self._sql_gen_kwargs,
             default_catalog=self._default_catalog,
-            execute_log_level=level,
+            execute_log_level=log_level,
             register_comments=self._register_comments,
             null_connection=True,
             multithreaded=self._multithreaded,
             pretty_sql=self._pretty_sql,
             **self._extra_config,
+            **kwargs,
         )
 
         return adapter
@@ -217,6 +222,8 @@ class EngineAdapter:
         *,
         batch_size: t.Optional[int] = None,
     ) -> t.List[SourceQuery]:
+        import pandas as pd
+
         batch_size = self.DEFAULT_BATCH_SIZE if batch_size is None else batch_size
         if isinstance(query_or_df, (exp.Query, exp.DerivedTable)):
             return [SourceQuery(query_factory=lambda: query_or_df)]  # type: ignore
@@ -244,6 +251,8 @@ class EngineAdapter:
         batch_size: int,
         target_table: TableName,
     ) -> t.List[SourceQuery]:
+        import pandas as pd
+
         assert isinstance(df, pd.DataFrame)
         num_rows = len(df.index)
         batch_size = sys.maxsize if batch_size == 0 else batch_size
@@ -257,7 +266,7 @@ class EngineAdapter:
             SourceQuery(
                 query_factory=partial(
                     self._values_to_sql,
-                    values=values,
+                    values=values,  # type: ignore
                     columns_to_types=columns_to_types,
                     batch_start=i,
                     batch_end=min(i + batch_size, num_rows),
@@ -295,6 +304,8 @@ class EngineAdapter:
     def _columns_to_types(
         self, query_or_df: QueryOrDF, columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None
     ) -> t.Optional[t.Dict[str, exp.DataType]]:
+        import pandas as pd
+
         if columns_to_types:
             return columns_to_types
         if isinstance(query_or_df, pd.DataFrame):
@@ -1006,6 +1017,8 @@ class EngineAdapter:
             view_properties: Optional view properties to add to the view.
             create_kwargs: Additional kwargs to pass into the Create expression
         """
+        import pandas as pd
+
         if materialized_properties and not materialized:
             raise SQLMeshError("Materialized properties are only supported for materialized views")
 
@@ -1206,6 +1219,22 @@ class EngineAdapter:
             kind="VIEW",
             materialized=materialized and self.SUPPORTS_MATERIALIZED_VIEWS,
             **kwargs,
+        )
+
+    def create_catalog(self, catalog_name: str | exp.Identifier) -> None:
+        return self._create_catalog(exp.parse_identifier(catalog_name, dialect=self.dialect))
+
+    def _create_catalog(self, catalog_name: exp.Identifier) -> None:
+        raise SQLMeshError(
+            f"Unable to create catalog '{catalog_name.sql(dialect=self.dialect)}' as automatic catalog management is not implemented in the {self.dialect} engine."
+        )
+
+    def drop_catalog(self, catalog_name: str | exp.Identifier) -> None:
+        return self._drop_catalog(exp.parse_identifier(catalog_name, dialect=self.dialect))
+
+    def _drop_catalog(self, catalog_name: exp.Identifier) -> None:
+        raise SQLMeshError(
+            f"Unable to drop catalog '{catalog_name.sql(dialect=self.dialect)}' as automatic catalog management is not implemented in the {self.dialect} engine."
         )
 
     def columns(
@@ -1488,6 +1517,7 @@ class EngineAdapter:
         unique_key: t.Sequence[exp.Expression],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
+        start: TimeLike,
         execution_time: t.Union[TimeLike, exp.Column],
         invalidate_hard_deletes: bool = True,
         updated_at_col: t.Optional[exp.Column] = None,
@@ -1682,8 +1712,14 @@ class EngineAdapter:
         existing_rows_query = exp.select(*table_columns, exp.true().as_("_exists")).from_(
             target_table
         )
+
+        cleanup_ts = None
         if truncate:
             existing_rows_query = existing_rows_query.limit(0)
+        else:
+            # If truncate is false it is not the first insert
+            # Determine the cleanup timestamp for restatement or a regular incremental run
+            cleanup_ts = to_time_column(start, time_data_type, self.dialect, nullable=True)
 
         with source_queries[0] as source_query:
             prefixed_columns_to_types = []
@@ -1721,12 +1757,41 @@ class EngineAdapter:
                 # Historical Records that Do Not Change
                 .with_(
                     "static",
-                    existing_rows_query.where(valid_to_col.is_(exp.Null()).not_()),
+                    existing_rows_query.where(valid_to_col.is_(exp.Null()).not_())
+                    if truncate
+                    else existing_rows_query.where(
+                        exp.and_(
+                            valid_to_col.is_(exp.Null().not_()),
+                            valid_to_col < cleanup_ts,
+                        ),
+                    ),
                 )
                 # Latest Records that can be updated
                 .with_(
                     "latest",
-                    existing_rows_query.where(valid_to_col.is_(exp.Null())),
+                    existing_rows_query.where(valid_to_col.is_(exp.Null()))
+                    if truncate
+                    else exp.select(
+                        *(
+                            to_time_column(
+                                exp.null(), time_data_type, self.dialect, nullable=True
+                            ).as_(col)
+                            if col == valid_to_col.name
+                            else exp.column(col)
+                            for col in columns_to_types
+                        ),
+                        exp.true().as_("_exists"),
+                    )
+                    .from_(target_table)
+                    .where(
+                        exp.and_(
+                            valid_from_col <= cleanup_ts,
+                            exp.or_(
+                                valid_to_col.is_(exp.null()),
+                                valid_to_col >= cleanup_ts,
+                            ),
+                        )
+                    ),
                 )
                 # Deleted records which can be used to determine `valid_from` for undeleted source records
                 .with_(
@@ -2012,6 +2077,8 @@ class EngineAdapter:
         """
         Take a "native" DataFrame (eg Pyspark, Bigframe, Snowpark etc) and convert it to Pandas
         """
+        import pandas as pd
+
         if isinstance(query_or_df, (exp.Query, exp.DerivedTable, pd.DataFrame)):
             return query_or_df
 
@@ -2022,6 +2089,8 @@ class EngineAdapter:
         self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
     ) -> pd.DataFrame:
         """Fetches a Pandas DataFrame from the cursor"""
+        import pandas as pd
+
         df = self._fetch_native_df(query, quote_identifiers=quote_identifiers)
         if not isinstance(df, pd.DataFrame):
             raise NotImplementedError(
@@ -2144,6 +2213,9 @@ class EngineAdapter:
                     sql = self._to_sql(e, quote=quote_identifiers, **to_sql_kwargs)
                 else:
                     sql = t.cast(str, e)
+
+                if self.correlation_id:
+                    sql = f"/* {self.correlation_id} */ {sql}"
 
                 self._log_sql(
                     sql,

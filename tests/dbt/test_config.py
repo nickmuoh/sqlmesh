@@ -943,13 +943,11 @@ def test_db_type_to_column_class():
     from dbt.adapters.bigquery import BigQueryColumn
     from dbt.adapters.databricks.column import DatabricksColumn
     from dbt.adapters.snowflake import SnowflakeColumn
-    from dbt.adapters.sqlserver.sqlserver_column import SQLServerColumn
 
     assert (TARGET_TYPE_TO_CONFIG_CLASS["bigquery"].column_class) == BigQueryColumn
     assert (TARGET_TYPE_TO_CONFIG_CLASS["databricks"].column_class) == DatabricksColumn
     assert (TARGET_TYPE_TO_CONFIG_CLASS["duckdb"].column_class) == Column
     assert (TARGET_TYPE_TO_CONFIG_CLASS["snowflake"].column_class) == SnowflakeColumn
-    assert (TARGET_TYPE_TO_CONFIG_CLASS["sqlserver"].column_class) == SQLServerColumn
 
     from dbt.adapters.clickhouse.column import ClickHouseColumn
     from dbt.adapters.trino.column import TrinoColumn

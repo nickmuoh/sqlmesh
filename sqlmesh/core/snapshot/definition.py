@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import typing as t
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -15,6 +16,7 @@ from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from sqlmesh.core import constants as c
 from sqlmesh.core.audit import StandaloneAudit
+from sqlmesh.core.environment import EnvironmentSuffixTarget
 from sqlmesh.core.macros import call_macro
 from sqlmesh.core.model import Model, ModelKindMixin, ModelKindName, ViewKind, CustomKind
 from sqlmesh.core.model.definition import _Model
@@ -49,6 +51,7 @@ from sqlmesh.utils.hashing import hash_data
 from sqlmesh.utils.pydantic import PydanticModel, field_validator
 
 if t.TYPE_CHECKING:
+    from sqlmesh.core.console import Console
     from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core.environment import EnvironmentNamingInfo
     from sqlmesh.core.context import ExecutionContext
@@ -274,13 +277,19 @@ class QualifiedViewName(PydanticModel, frozen=True):
     def catalog_for_environment(
         self, environment_naming_info: EnvironmentNamingInfo, dialect: DialectType = None
     ) -> t.Optional[str]:
-        if environment_naming_info.catalog_name_override:
+        catalog_name: t.Optional[str] = None
+        if environment_naming_info.is_dev and environment_naming_info.suffix_target.is_catalog:
+            catalog_name = f"{self.catalog}__{environment_naming_info.name}"
+        elif environment_naming_info.catalog_name_override:
             catalog_name = environment_naming_info.catalog_name_override
+
+        if catalog_name:
             return (
                 normalize_identifiers(catalog_name, dialect=dialect).name
                 if environment_naming_info.normalize_name
                 else catalog_name
             )
+
         return self.catalog
 
     def schema_for_environment(
@@ -295,10 +304,7 @@ class QualifiedViewName(PydanticModel, frozen=True):
             if normalize:
                 schema = normalize_identifiers(schema, dialect=dialect).name
 
-        if (
-            environment_naming_info.name.lower() != c.PROD
-            and environment_naming_info.suffix_target.is_schema
-        ):
+        if environment_naming_info.is_dev and environment_naming_info.suffix_target.is_schema:
             env_name = environment_naming_info.name
             if normalize:
                 env_name = normalize_identifiers(env_name, dialect=dialect).name
@@ -311,10 +317,7 @@ class QualifiedViewName(PydanticModel, frozen=True):
         self, environment_naming_info: EnvironmentNamingInfo, dialect: DialectType = None
     ) -> str:
         table = self.table
-        if (
-            environment_naming_info.name.lower() != c.PROD
-            and environment_naming_info.suffix_target.is_table
-        ):
+        if environment_naming_info.is_dev and environment_naming_info.suffix_target.is_table:
             env_name = environment_naming_info.name
             if environment_naming_info.normalize_name:
                 env_name = normalize_identifiers(env_name, dialect=dialect).name
@@ -783,7 +786,9 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
 
             # only warn if the requested removal interval was a subset of the actual model intervals and was automatically expanded
             # if the requested interval was the same or wider than the actual model intervals, no need to warn
-            if requested_start > expanded_start or requested_end < expanded_end:
+            if (
+                requested_start > expanded_start or requested_end < expanded_end
+            ) and self.is_incremental:
                 from sqlmesh.core.console import get_console
 
                 get_console().log_warning(
@@ -793,6 +798,21 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                 )
 
             removal_interval = expanded_removal_interval
+
+        # SCD Type 2 validation that end date is the latest interval if it was provided
+        if not is_preview and self.is_scd_type_2 and self.intervals:
+            requested_start, requested_end = removal_interval
+            latest_end = self.intervals[-1][1]
+            if requested_end < latest_end:
+                from sqlmesh.core.console import get_console
+
+                get_console().log_warning(
+                    f"SCD Type 2 model '{self.model.name}' does not support end date in restatements.\n"
+                    f"Requested end date [{to_ts(requested_end)}] is less than the latest interval end date.\n"
+                    f"The requested end date will be ignored. Using the latest interval end instead: [{to_ts(latest_end)}]"
+                )
+
+                removal_interval = self.inclusive_exclusive(requested_start, latest_end, strict)
 
         return removal_interval
 
@@ -947,7 +967,14 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             model_end_ts,
         )
 
-    def check_ready_intervals(self, intervals: Intervals, context: ExecutionContext) -> Intervals:
+    def check_ready_intervals(
+        self,
+        intervals: Intervals,
+        context: ExecutionContext,
+        console: t.Optional[Console] = None,
+        default_catalog: t.Optional[str] = None,
+        environment_naming_info: t.Optional[EnvironmentNamingInfo] = None,
+    ) -> Intervals:
         """Returns a list of intervals that are considered ready by the provided signal.
 
         Note that this will handle gaps in the provided intervals. The returned intervals
@@ -961,7 +988,19 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
         python_env = self.model.python_env
         env = prepare_env(python_env)
 
-        for signal_name, kwargs in signals.items():
+        if console:
+            console.start_signal_progress(
+                self,
+                default_catalog,
+                environment_naming_info or EnvironmentNamingInfo(),
+            )
+
+        for signal_idx, (signal_name, kwargs) in enumerate(signals.items()):
+            # Capture intervals before signal check for display
+            intervals_to_check = merge_intervals(intervals)
+
+            signal_start_ts = time.perf_counter()
+
             try:
                 intervals = _check_ready_intervals(
                     env[signal_name],
@@ -977,6 +1016,23 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
                 raise SQLMeshError(
                     f"{e} '{signal_name}' for '{self.model.name}' at {self.model._path}"
                 )
+
+            duration = time.perf_counter() - signal_start_ts
+
+            if console:
+                console.update_signal_progress(
+                    snapshot=self,
+                    signal_name=signal_name,
+                    signal_idx=signal_idx,
+                    total_signals=len(signals),
+                    ready_intervals=merge_intervals(intervals),
+                    check_intervals=intervals_to_check,
+                    duration=duration,
+                )
+
+        # Stop signal progress tracking
+        if console:
+            console.stop_signal_progress()
 
         return intervals
 
@@ -1589,12 +1645,18 @@ def display_name(
     if snapshot_info_like.is_audit:
         return snapshot_info_like.name
     view_name = exp.to_table(snapshot_info_like.name)
+
+    catalog = (
+        None
+        if (
+            environment_naming_info.suffix_target != EnvironmentSuffixTarget.CATALOG
+            and view_name.catalog == default_catalog
+        )
+        else view_name.catalog
+    )
+
     qvn = QualifiedViewName(
-        catalog=(
-            view_name.catalog
-            if view_name.catalog and view_name.catalog != default_catalog
-            else None
-        ),
+        catalog=catalog,
         schema_name=view_name.db or None,
         table=view_name.name,
     )
@@ -1843,7 +1905,7 @@ def missing_intervals(
     return missing
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=16384)
 def expand_range(start_ts: int, end_ts: int, interval_unit: IntervalUnit) -> t.List[int]:
     croniter = interval_unit.croniter(start_ts)
     timestamps = [start_ts]
@@ -1860,7 +1922,7 @@ def expand_range(start_ts: int, end_ts: int, interval_unit: IntervalUnit) -> t.L
     return timestamps
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=16384)
 def compute_missing_intervals(
     interval_unit: IntervalUnit,
     intervals: t.Tuple[Interval, ...],
@@ -1922,7 +1984,7 @@ def compute_missing_intervals(
     return sorted(missing)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=16384)
 def inclusive_exclusive(
     start: TimeLike,
     end: TimeLike,
@@ -1995,7 +2057,12 @@ def earliest_start_date(
             start_date(snapshot, snapshots, cache=cache, relative_to=relative_to)
             for snapshot in snapshots.values()
         )
-    return yesterday()
+
+    relative_base = None
+    if relative_to is not None:
+        relative_base = to_datetime(relative_to)
+
+    return yesterday(relative_base=relative_base)
 
 
 def start_date(

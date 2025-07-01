@@ -4,26 +4,110 @@ import { isErr } from '@bus/result'
 import { RenderModelEntry } from '../lsp/custom'
 import { RenderedModelProvider } from '../providers/renderedModelProvider'
 
+export async function reRenderModelForSourceFile(
+  sourceUri: string,
+  lspClient: LSPClient,
+  renderedModelProvider: RenderedModelProvider,
+): Promise<void> {
+  const renderedUri = renderedModelProvider.getRenderedUriForSource(sourceUri)
+  if (!renderedUri) {
+    return // No rendered model exists for this source file
+  }
+
+  // Call the render model API
+  const result = await lspClient.call_custom_method('sqlmesh/render_model', {
+    textDocumentUri: sourceUri,
+  })
+
+  if (isErr(result)) {
+    // Silently fail on auto-rerender errors to avoid spamming user
+    return
+  }
+
+  // Check if we got any models
+  if (!result.value.models || result.value.models.length === 0) {
+    return
+  }
+
+  // Get the originally rendered model information
+  const originalModelInfo =
+    renderedModelProvider.getModelInfoForRendered(renderedUri)
+
+  // Find the specific model that was originally rendered, or fall back to the first model
+  const selectedModel = originalModelInfo
+    ? result.value.models.find(
+        model =>
+          model.name === originalModelInfo.name &&
+          model.fqn === originalModelInfo.fqn,
+      ) || result.value.models[0]
+    : result.value.models[0]
+
+  // Update the existing rendered model content
+  renderedModelProvider.updateRenderedModel(
+    renderedUri,
+    selectedModel.rendered_query,
+  )
+}
+
 export function renderModel(
   lspClient?: LSPClient,
   renderedModelProvider?: RenderedModelProvider,
 ) {
   return async () => {
-    // Get the current active editor
-    const activeEditor = vscode.window.activeTextEditor
-
-    if (!activeEditor) {
-      vscode.window.showErrorMessage('No active editor found')
-      return
-    }
-
     if (!lspClient) {
       vscode.window.showErrorMessage('LSP client not available')
       return
     }
 
-    // Get the current document URI
-    const documentUri = activeEditor.document.uri.toString(true)
+    // Get the current active editor
+    const activeEditor = vscode.window.activeTextEditor
+
+    let documentUri: string
+
+    if (!activeEditor) {
+      // No active editor, show a list of all models
+      const allModelsResult = await lspClient.call_custom_method(
+        'sqlmesh/all_models_for_render',
+        {},
+      )
+
+      if (isErr(allModelsResult)) {
+        vscode.window.showErrorMessage(
+          `Failed to get models: ${allModelsResult.error.message}`,
+        )
+        return
+      }
+
+      if (
+        !allModelsResult.value.models ||
+        allModelsResult.value.models.length === 0
+      ) {
+        vscode.window.showInformationMessage('No models found in the project')
+        return
+      }
+
+      // Let user choose from all models
+      const items = allModelsResult.value.models.map(model => ({
+        label: model.name,
+        description: model.fqn,
+        detail: model.description ? model.description : undefined,
+        model: model,
+      }))
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select a model to render',
+      })
+
+      if (!selected) {
+        return
+      }
+
+      // Use the selected model's URI
+      documentUri = selected.model.uri
+    } else {
+      // Get the current document URI
+      documentUri = activeEditor.document.uri.toString(true)
+    }
 
     // Call the render model API
     const result = await lspClient.call_custom_method('sqlmesh/render_model', {
@@ -31,7 +115,9 @@ export function renderModel(
     })
 
     if (isErr(result)) {
-      vscode.window.showErrorMessage(`Failed to render model: ${result.error}`)
+      vscode.window.showErrorMessage(
+        `Failed to render model: ${result.error.message}`,
+      )
       return
     }
 
@@ -75,6 +161,8 @@ export function renderModel(
     const uri = renderedModelProvider.storeRenderedModel(
       selectedModel.name,
       selectedModel.rendered_query,
+      documentUri,
+      selectedModel,
     )
 
     // Open the virtual document

@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import typing as t
 
-import numpy as np
-import pandas as pd
-from pandas.api.types import is_datetime64_any_dtype  # type: ignore
 from sqlglot import exp
 
-from sqlmesh.core.dialect import to_schema
+from sqlmesh.core.dialect import to_schema, add_table
 from sqlmesh.core.engine_adapter.base import (
     EngineAdapterWithIndexSupport,
     EngineAdapter,
     InsertOverwriteStrategy,
+    MERGE_SOURCE_ALIAS,
+    MERGE_TARGET_ALIAS,
 )
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
@@ -35,7 +34,7 @@ from sqlmesh.core.schema_diff import SchemaDiffer
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
-    from sqlmesh.core.engine_adapter._typing import DF, Query
+    from sqlmesh.core.engine_adapter._typing import DF, Query, QueryOrDF
 
 
 @set_catalog()
@@ -93,18 +92,18 @@ class MSSQLEngineAdapter(
 
         sql = (
             exp.select(
-                "column_name",
-                "data_type",
-                "character_maximum_length",
-                "numeric_precision",
-                "numeric_scale",
+                "COLUMN_NAME",
+                "DATA_TYPE",
+                "CHARACTER_MAXIMUM_LENGTH",
+                "NUMERIC_PRECISION",
+                "NUMERIC_SCALE",
             )
-            .from_("information_schema.columns")
-            .where(f"table_name = '{table.name}'")
+            .from_("INFORMATION_SCHEMA.COLUMNS")
+            .where(f"TABLE_NAME = '{table.name}'")
         )
         database_name = table.db
         if database_name:
-            sql = sql.where(f"table_schema = '{database_name}'")
+            sql = sql.where(f"TABLE_SCHEMA = '{database_name}'")
 
         columns_raw = self.fetchall(sql, quote_identifiers=True)
 
@@ -148,12 +147,12 @@ class MSSQLEngineAdapter(
 
         sql = (
             exp.select("1")
-            .from_("information_schema.tables")
-            .where(f"table_name = '{table.alias_or_name}'")
+            .from_("INFORMATION_SCHEMA.TABLES")
+            .where(f"TABLE_NAME = '{table.alias_or_name}'")
         )
         database_name = table.db
         if database_name:
-            sql = sql.where(f"table_schema = '{database_name}'")
+            sql = sql.where(f"TABLE_SCHEMA = '{database_name}'")
 
         result = self.fetchone(sql, quote_identifiers=True)
 
@@ -175,20 +174,109 @@ class MSSQLEngineAdapter(
         if cascade:
             objects = self._get_data_objects(schema_name)
             for obj in objects:
+                # Build properly quoted table for MSSQL using square brackets when needed
+                object_table = exp.table_(obj.name, obj.schema_name)
+
                 # _get_data_objects is catalog-specific, so these can't accidentally drop view/tables in another catalog
                 if obj.type == DataObjectType.VIEW:
                     self.drop_view(
-                        ".".join([obj.schema_name, obj.name]),
+                        object_table,
                         ignore_if_not_exists=ignore_if_not_exists,
                     )
                 else:
                     self.drop_table(
-                        ".".join([obj.schema_name, obj.name]),
+                        object_table,
                         exists=ignore_if_not_exists,
                     )
         super().drop_schema(schema_name, ignore_if_not_exists=ignore_if_not_exists, cascade=False)
 
+    def merge(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+        unique_key: t.Sequence[exp.Expression],
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expression] = None,
+    ) -> None:
+        source_queries, columns_to_types = self._get_source_queries_and_columns_to_types(
+            source_table, columns_to_types, target_table=target_table
+        )
+        columns_to_types = columns_to_types or self.columns(target_table)
+        on = exp.and_(
+            *(
+                add_table(part, MERGE_TARGET_ALIAS).eq(add_table(part, MERGE_SOURCE_ALIAS))
+                for part in unique_key
+            )
+        )
+        if merge_filter:
+            on = exp.and_(merge_filter, on)
+
+        match_expressions = []
+        if not when_matched:
+            match_condition = None
+            unique_key_names = [y.name for y in unique_key]
+            columns_to_types_no_keys = [c for c in columns_to_types if c not in unique_key_names]
+
+            target_columns_no_keys = [
+                exp.column(c, MERGE_TARGET_ALIAS) for c in columns_to_types_no_keys
+            ]
+            source_columns_no_keys = [
+                exp.column(c, MERGE_SOURCE_ALIAS) for c in columns_to_types_no_keys
+            ]
+
+            match_condition = exp.Exists(
+                this=exp.select(*target_columns_no_keys).except_(
+                    exp.select(*source_columns_no_keys)
+                )
+            )
+
+            if target_columns_no_keys:
+                match_expressions.append(
+                    exp.When(
+                        matched=True,
+                        source=False,
+                        condition=match_condition,
+                        then=exp.Update(
+                            expressions=[
+                                exp.column(col, MERGE_TARGET_ALIAS).eq(
+                                    exp.column(col, MERGE_SOURCE_ALIAS)
+                                )
+                                for col in columns_to_types_no_keys
+                            ],
+                        ),
+                    )
+                )
+        else:
+            match_expressions.extend(when_matched.copy().expressions)
+
+        match_expressions.append(
+            exp.When(
+                matched=False,
+                source=False,
+                then=exp.Insert(
+                    this=exp.Tuple(expressions=[exp.column(col) for col in columns_to_types]),
+                    expression=exp.Tuple(
+                        expressions=[
+                            exp.column(col, MERGE_SOURCE_ALIAS) for col in columns_to_types
+                        ]
+                    ),
+                ),
+            )
+        )
+        for source_query in source_queries:
+            with source_query as query:
+                self._merge(
+                    target_table=target_table,
+                    query=query,
+                    on=on,
+                    whens=exp.Whens(expressions=match_expressions),
+                )
+
     def _convert_df_datetime(self, df: DF, columns_to_types: t.Dict[str, exp.DataType]) -> None:
+        import pandas as pd
+        from pandas.api.types import is_datetime64_any_dtype  # type: ignore
+
         # pymssql doesn't convert Pandas Timestamp (datetime64) types
         # - this code is based on snowflake adapter implementation
         for column, kind in columns_to_types.items():
@@ -213,8 +301,15 @@ class MSSQLEngineAdapter(
         batch_size: int,
         target_table: TableName,
     ) -> t.List[SourceQuery]:
+        import pandas as pd
+        import numpy as np
+
         assert isinstance(df, pd.DataFrame)
         temp_table = self._get_temp_table(target_table or "pandas")
+
+        # Return the superclass implementation if the connection pool doesn't support bulk_copy
+        if not hasattr(self._connection_pool.get(), "bulk_copy"):
+            return super()._df_to_source_queries(df, columns_to_types, batch_size, target_table)
 
         def query_factory() -> Query:
             # It is possible for the factory to be called multiple times and if so then the temp table will already
@@ -247,6 +342,8 @@ class MSSQLEngineAdapter(
         """
         Returns all the data objects that exist in the given schema and catalog.
         """
+        import pandas as pd
+
         catalog = self.get_current_catalog()
         query = (
             exp.select(

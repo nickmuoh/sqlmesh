@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import typing as t
-import pandas as pd
 import json
 import logging
 from sqlglot import exp
@@ -16,6 +15,9 @@ from sqlmesh.core.environment import Environment, EnvironmentStatements, Environ
 from sqlmesh.utils.migration import index_text_type, blob_text_type
 from sqlmesh.utils.date import now_timestamp, time_like_to_str
 from sqlmesh.utils.errors import SQLMeshError
+
+if t.TYPE_CHECKING:
+    import pandas as pd
 
 
 logger = logging.getLogger(__name__)
@@ -163,27 +165,20 @@ class EnvironmentState:
             where=environment_filter,
         )
 
-    def get_expired_environments(self, current_ts: int) -> t.List[Environment]:
+    def get_expired_environments(self, current_ts: int) -> t.List[EnvironmentSummary]:
         """Returns the expired environments.
 
         Expired environments are environments that have exceeded their time-to-live value.
         Returns:
-            The list of environments to remove, the filter to remove environments.
+            The list of environment summaries to remove.
         """
-        rows = fetchall(
-            self.engine_adapter,
-            self._environments_query(
-                where=self._create_expiration_filter_expr(current_ts),
-                lock_for_update=True,
-            ),
+        return self._fetch_environment_summaries(
+            where=self._create_expiration_filter_expr(current_ts)
         )
-        expired_environments = [self._environment_from_row(r) for r in rows]
-
-        return expired_environments
 
     def delete_expired_environments(
         self, current_ts: t.Optional[int] = None
-    ) -> t.List[Environment]:
+    ) -> t.List[EnvironmentSummary]:
         """Deletes expired environments.
 
         Returns:
@@ -226,13 +221,7 @@ class EnvironmentState:
         Returns:
             A list of all environment summaries.
         """
-        return [
-            self._environment_summmary_from_row(row)
-            for row in fetchall(
-                self.engine_adapter,
-                self._environments_query(required_fields=list(EnvironmentSummary.all_fields())),
-            )
-        ]
+        return self._fetch_environment_summaries()
 
     def get_environment(
         self, environment: str, lock_for_update: bool = False
@@ -328,8 +317,24 @@ class EnvironmentState:
             expression=exp.Literal.number(current_ts),
         )
 
+    def _fetch_environment_summaries(
+        self, where: t.Optional[str | exp.Expression] = None
+    ) -> t.List[EnvironmentSummary]:
+        return [
+            self._environment_summmary_from_row(row)
+            for row in fetchall(
+                self.engine_adapter,
+                self._environments_query(
+                    where=where,
+                    required_fields=list(EnvironmentSummary.all_fields()),
+                ),
+            )
+        ]
+
 
 def _environment_to_df(environment: Environment) -> pd.DataFrame:
+    import pandas as pd
+
     return pd.DataFrame(
         [
             {
@@ -364,6 +369,8 @@ def _environment_to_df(environment: Environment) -> pd.DataFrame:
 def _environment_statements_to_df(
     environment_name: str, plan_id: str, environment_statements: t.List[EnvironmentStatements]
 ) -> pd.DataFrame:
+    import pandas as pd
+
     return pd.DataFrame(
         [
             {

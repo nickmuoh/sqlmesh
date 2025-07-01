@@ -55,7 +55,7 @@ If you are using Tobiko Cloud, the `tcloud` library will install SQLMesh for you
 First, follow the [Python setup](#python-setup) steps above to create and activate a Python environment. Next, install `tcloud`:
 
 ```bash
-pip install tcloud
+pip install tcloud # always make sure to install the latest version of tcloud
 ```
 
 Finally, add the `lsp` extra to your `tcloud.yml` configuration file, as described [here](../cloud/tcloud_getting_started.md#connect-tobiko-cloud-to-data-warehouse).
@@ -95,6 +95,10 @@ The extension adds a lineage view to SQLMesh models. To view the lineage of a mo
 
 ![Lineage view](./vscode/lineage.png)
 
+### Render
+
+The extension allows you to render a model with the macros resolved. You can invoke it either with the command palette `Render SQLMesh Model` or by clicking the preview button in the top right.
+
 ### Editor
 
 The SQLMesh VSCode extension includes several features that make editing SQLMesh models easier and quicker:
@@ -107,7 +111,13 @@ See auto-completion suggestions when writing SQL models, keywords, or model name
 
 **Go to definition and hover information**
 
-Hovering over a model name shows a tooltip with the model description. Clicking the model name opens the file containing the model definition.
+Hovering over a model name shows a tooltip with the model description. 
+
+In addition to hover information, you can go to a definition of the following objects in a SQL file by either right-clicking and choosing "Go to definition" or by `Command/Control + Click` on the respective reference. This currently works for:
+
+- Model references in a SQL file like `FROM my_model`
+- CTE reference in a SQL file like `WITH my_cte AS (...) ... FROM my_cte` 
+- Python macros in a SQL file like `SELECT @my_macro(...)`
 
 **Diagnostics**
 
@@ -129,7 +139,47 @@ The SQLMesh VSCode extension provides the following commands in the VSCode comma
 
 ## Troubleshooting
 
-### Python environment woes
+### DuckDB concurrent access
+
+If your SQLMesh project uses DuckDB to store its state, you will likely encounter problems.
+
+SQLMesh can create multiple connections to the state database, but DuckDB's local database file does not support concurrent access.
+
+Because the VSCode extension establishes a long-running process connected to the database, access conflicts are more likely than with standard SQLMesh usage from the CLI. 
+
+Therefore, we do not recommend using DuckDB as a state store with the VSCode extension.
+
+### Environment variables
+
+The VSCode extension is based on a [language server](https://en.wikipedia.org/wiki/Language_Server_Protocol) that runs in the background as a separate process. When the VSCode extension starts the background language server, the server inherits environment variables from the environment where you started VSCode. The server does *not* inherit environment variables from your terminal instance in VSCode, so it may not have access to variables you use when calling SQLMesh from the CLI.
+
+If you have environment variables that are needed by the context and the language server, you can use one of these approaches to pass variables to the language server:
+
+- Open VSCode from a terminal that has the variables set already. 
+  - If you have `export ENV_VAR=value` in your shell configuration file (e.g. `.zshrc` or `.bashrc`) when initializing the terminal by default, the variables will be picked up by the language server if opened from that terminal.
+- Use environment variables pulled from somewhere else dynamically in your `config.py` for example by connecting to a secret store
+- By default, a `.env` file in your root project directory will automatically be picked up by the language server through the python environment that the extension uses. For exact details on how to set the environment variables in the Python environment that the extension uses, see [here](https://code.visualstudio.com/docs/python/environments#_environment-variables)
+
+You can verify that the environment variables are being passed to the language server by printing them in your terminal. 
+
+1. `Cmd +Shift + P` (`Ctrl + Shift + P` in case of Windows) to start the VSCode command bar
+   ![print_env_vars](./vscode/print_env_vars.png)
+2. Select the option: `SQLMesh: Print Environment Variables`
+3. You should see the environment variables printed in the terminal
+   ![terminal_env_vars](./vscode/terminal_env_vars.png)
+
+If you change your setup during development (e.g., add variables to your shell config), you must restart the language server for the changes to take effect. You can do this by running the following command in the terminal:
+
+1. `Cmd +Shift + P` (`Ctrl + Shift + P` in case of Windows) to start the VSCode command bar
+2. Select the option: `SQLMesh: Restart Servers`
+   ![restart_servers](./vscode/restart_servers.png)
+   ![loaded](./vscode/loaded.png)
+
+   > This loaded message will appear in the lower left corner of the VSCode window.
+
+3. Print the environment variables based on the instructions above to verify the changes have taken effect.
+
+### Python environment issues
 
 The most common problem is the extension not using the correct Python interpreter.
 

@@ -7,9 +7,8 @@ import unittest
 import uuid
 import logging
 import textwrap
+from itertools import zip_longest
 from pathlib import Path
-import pandas as pd
-import numpy as np
 from hyperscript import h
 from rich.console import Console as RichConsole
 from rich.live import Live
@@ -28,6 +27,7 @@ from rich.table import Table
 from rich.tree import Tree
 from sqlglot import exp
 
+from sqlmesh.core.test.result import ModelTextTestResult
 from sqlmesh.core.environment import EnvironmentNamingInfo, EnvironmentSummary
 from sqlmesh.core.linter.rule import RuleViolation
 from sqlmesh.core.model import Model
@@ -48,6 +48,7 @@ from sqlmesh.utils.errors import (
     NodeAuditsErrors,
     format_destructive_change_msg,
 )
+from sqlmesh.utils.rich import strip_ansi_codes
 
 if t.TYPE_CHECKING:
     import ipywidgets as widgets
@@ -318,7 +319,47 @@ class PlanBuilderConsole(BaseConsole, abc.ABC):
         """Display a destructive change error or warning to the user."""
 
 
+class UnitTestConsole(abc.ABC):
+    @abc.abstractmethod
+    def log_test_results(self, result: ModelTextTestResult, target_dialect: str) -> None:
+        """Display the test result and output.
+
+        Args:
+            result: The unittest test result that contains metrics like num success, fails, ect.
+            target_dialect: The dialect that tests were run against. Assumes all tests run against the same dialect.
+        """
+
+
+class SignalConsole(abc.ABC):
+    @abc.abstractmethod
+    def start_signal_progress(
+        self,
+        snapshot: Snapshot,
+        default_catalog: t.Optional[str],
+        environment_naming_info: EnvironmentNamingInfo,
+    ) -> None:
+        """Indicates that signal checking has begun for a snapshot."""
+
+    @abc.abstractmethod
+    def update_signal_progress(
+        self,
+        snapshot: Snapshot,
+        signal_name: str,
+        signal_idx: int,
+        total_signals: int,
+        ready_intervals: Intervals,
+        check_intervals: Intervals,
+        duration: float,
+    ) -> None:
+        """Updates the signal checking progress."""
+
+    @abc.abstractmethod
+    def stop_signal_progress(self) -> None:
+        """Indicates that signal checking has completed for a snapshot."""
+
+
 class Console(
+    SignalConsole,
     PlanBuilderConsole,
     LinterConsole,
     StateExporterConsole,
@@ -329,6 +370,7 @@ class Console(
     DifferenceConsole,
     TableDiffConsole,
     BaseConsole,
+    UnitTestConsole,
     abc.ABC,
 ):
     """Abstract base class for defining classes used for displaying information to the user and also interact
@@ -463,18 +505,6 @@ class Console(
         """
 
     @abc.abstractmethod
-    def log_test_results(
-        self, result: unittest.result.TestResult, output: t.Optional[str], target_dialect: str
-    ) -> None:
-        """Display the test result and output.
-
-        Args:
-            result: The unittest test result that contains metrics like num success, fails, ect.
-            output: The generated output from the unittest.
-            target_dialect: The dialect that tests were run against. Assumes all tests run against the same dialect.
-        """
-
-    @abc.abstractmethod
     def show_sql(self, sql: str) -> None:
         """Display to the user SQL."""
 
@@ -533,6 +563,29 @@ class NoopConsole(Console):
         pass
 
     def stop_evaluation_progress(self, success: bool = True) -> None:
+        pass
+
+    def start_signal_progress(
+        self,
+        snapshot: Snapshot,
+        default_catalog: t.Optional[str],
+        environment_naming_info: EnvironmentNamingInfo,
+    ) -> None:
+        pass
+
+    def update_signal_progress(
+        self,
+        snapshot: Snapshot,
+        signal_name: str,
+        signal_idx: int,
+        total_signals: int,
+        ready_intervals: Intervals,
+        check_intervals: Intervals,
+        duration: float,
+    ) -> None:
+        pass
+
+    def stop_signal_progress(self) -> None:
         pass
 
     def start_creation_progress(
@@ -670,9 +723,7 @@ class NoopConsole(Console):
         if auto_apply:
             plan_builder.apply()
 
-    def log_test_results(
-        self, result: unittest.result.TestResult, output: t.Optional[str], target_dialect: str
-    ) -> None:
+    def log_test_results(self, result: ModelTextTestResult, target_dialect: str) -> None:
         pass
 
     def show_sql(self, sql: str) -> None:
@@ -861,6 +912,8 @@ class TerminalConsole(Console):
         self.table_diff_model_tasks: t.Dict[str, TaskID] = {}
         self.table_diff_progress_live: t.Optional[Live] = None
 
+        self.signal_status_tree: t.Optional[Tree] = None
+
         self.verbosity = verbosity
         self.dialect = dialect
         self.ignore_warnings = ignore_warnings
@@ -902,6 +955,9 @@ class TerminalConsole(Console):
         audit_only: bool = False,
     ) -> None:
         """Indicates that a new snapshot evaluation/auditing progress has begun."""
+        # Add a newline to separate signal checking from evaluation
+        self._print("")
+
         if not self.evaluation_progress_live:
             self.evaluation_total_progress = make_progress_bar(
                 "Executing model batches" if not audit_only else "Auditing models", self.console
@@ -1050,6 +1106,88 @@ class TerminalConsole(Console):
         self.evaluation_column_widths = {}
         self.environment_naming_info = EnvironmentNamingInfo()
         self.default_catalog = None
+
+    def start_signal_progress(
+        self,
+        snapshot: Snapshot,
+        default_catalog: t.Optional[str],
+        environment_naming_info: EnvironmentNamingInfo,
+    ) -> None:
+        """Indicates that signal checking has begun for a snapshot."""
+        display_name = snapshot.display_name(
+            environment_naming_info,
+            default_catalog if self.verbosity < Verbosity.VERY_VERBOSE else None,
+            dialect=self.dialect,
+        )
+        self.signal_status_tree = Tree(f"Checking signals for {display_name}")
+
+    def update_signal_progress(
+        self,
+        snapshot: Snapshot,
+        signal_name: str,
+        signal_idx: int,
+        total_signals: int,
+        ready_intervals: Intervals,
+        check_intervals: Intervals,
+        duration: float,
+    ) -> None:
+        """Updates the signal checking progress."""
+        tree = Tree(f"[{signal_idx + 1}/{total_signals}] {signal_name} {duration:.2f}s")
+
+        formatted_check_intervals = [_format_signal_interval(snapshot, i) for i in check_intervals]
+        formatted_ready_intervals = [_format_signal_interval(snapshot, i) for i in ready_intervals]
+
+        if not formatted_check_intervals:
+            formatted_check_intervals = ["no intervals"]
+        if not formatted_ready_intervals:
+            formatted_ready_intervals = ["no intervals"]
+
+        # Color coding to help detect partial interval ranges quickly
+        if ready_intervals == check_intervals:
+            msg = "All ready"
+            color = "green"
+        elif ready_intervals:
+            msg = "Some ready"
+            color = "yellow"
+        else:
+            msg = "None ready"
+            color = "red"
+
+        if self.verbosity < Verbosity.VERY_VERBOSE:
+            num_check_intervals = len(formatted_check_intervals)
+            if num_check_intervals > 3:
+                formatted_check_intervals = formatted_check_intervals[:3]
+                formatted_check_intervals.append(f"... and {num_check_intervals - 3} more")
+
+            num_ready_intervals = len(formatted_ready_intervals)
+            if num_ready_intervals > 3:
+                formatted_ready_intervals = formatted_ready_intervals[:3]
+                formatted_ready_intervals.append(f"... and {num_ready_intervals - 3} more")
+
+            check = ", ".join(formatted_check_intervals)
+            tree.add(f"Check: {check}")
+
+            ready = ", ".join(formatted_ready_intervals)
+            tree.add(f"[{color}]{msg}: {ready}[/{color}]")
+        else:
+            check_tree = Tree("Check")
+            tree.add(check_tree)
+            for interval in formatted_check_intervals:
+                check_tree.add(interval)
+
+            ready_tree = Tree(f"[{color}]{msg}[/{color}]")
+            tree.add(ready_tree)
+            for interval in formatted_ready_intervals:
+                ready_tree.add(f"[{color}]{interval}[/{color}]")
+
+        if self.signal_status_tree is not None:
+            self.signal_status_tree.add(tree)
+
+    def stop_signal_progress(self) -> None:
+        """Indicates that signal checking has completed for a snapshot."""
+        if self.signal_status_tree is not None:
+            self._print(self.signal_status_tree)
+            self.signal_status_tree = None
 
     def start_creation_progress(
         self,
@@ -1954,29 +2092,42 @@ class TerminalConsole(Console):
         ):
             plan_builder.apply()
 
-    def log_test_results(
-        self, result: unittest.result.TestResult, output: t.Optional[str], target_dialect: str
-    ) -> None:
+    def log_test_results(self, result: ModelTextTestResult, target_dialect: str) -> None:
+        # We don't log the test results if no tests were ran
+        if not result.testsRun:
+            return
+
         divider_length = 70
+
+        self._log_test_details(result)
+
+        message = (
+            f"Ran {result.testsRun} tests against {target_dialect} in {result.duration} seconds."
+        )
         if result.wasSuccessful():
             self._print("=" * divider_length)
             self._print(
-                f"Successfully Ran {str(result.testsRun)} tests against {target_dialect}",
+                f"Successfully {message}",
                 style="green",
             )
             self._print("-" * divider_length)
         else:
             self._print("-" * divider_length)
-            self._print("Test Failure Summary")
+            self._print("Test Failure Summary", style="red")
             self._print("=" * divider_length)
-            self._print(
-                f"Num Successful Tests: {result.testsRun - len(result.failures) - len(result.errors)}"
-            )
+            failures = len(result.failures) + len(result.errors)
+            self._print(f"{message} \n")
+
+            self._print(f"Failed tests ({failures}):")
             for test, _ in result.failures + result.errors:
                 if isinstance(test, ModelTest):
-                    self._print(f"Failure Test: {test.model.name} {test.test_name}")
-            self._print("=" * divider_length)
-            self._print(output)
+                    self._print(f" • {test.path}::{test.test_name}")
+            self._print("=" * divider_length, end="\n\n")
+
+    def _captured_unit_test_results(self, result: ModelTextTestResult) -> str:
+        with self.console.capture() as capture:
+            self._log_test_details(result)
+        return strip_ansi_codes(capture.get())
 
     def show_sql(self, sql: str) -> None:
         self._print(Syntax(sql, "sql", word_wrap=True), crop=False)
@@ -2494,9 +2645,64 @@ class TerminalConsole(Console):
         else:
             self.log_warning(msg)
 
+    def _log_test_details(
+        self, result: ModelTextTestResult, unittest_char_separator: bool = True
+    ) -> None:
+        """
+        This is a helper method that encapsulates the logic for logging the relevant unittest for the result.
+        The top level method (`log_test_results`) reuses `_log_test_details` differently based on the console.
+
+        Args:
+            result: The unittest test result that contains metrics like num success, fails, ect.
+        """
+
+        if result.wasSuccessful():
+            self._print("\n", end="")
+            return
+
+        errors = result.errors
+        failures = result.failures
+        skipped = result.skipped
+
+        infos = []
+        if failures:
+            infos.append(f"failures={len(failures)}")
+        if errors:
+            infos.append(f"errors={len(errors)}")
+        if skipped:
+            infos.append(f"skipped={skipped}")
+
+        if unittest_char_separator:
+            self._print(f"\n{unittest.TextTestResult.separator1}\n\n", end="")
+
+        for (test_case, failure), test_failure_tables in zip_longest(  # type: ignore
+            failures, result.failure_tables
+        ):
+            self._print(unittest.TextTestResult.separator2)
+            self._print(f"FAIL: {test_case}")
+
+            if test_description := test_case.shortDescription():
+                self._print(test_description)
+            self._print(f"{unittest.TextTestResult.separator2}")
+
+            if not test_failure_tables:
+                self._print(failure)
+            else:
+                for failure_table in test_failure_tables:
+                    self._print(failure_table)
+                    self._print("\n", end="")
+
+        for test_case, error in errors:
+            self._print(unittest.TextTestResult.separator2)
+            self._print(f"ERROR: {test_case}")
+            self._print(f"{unittest.TextTestResult.separator2}")
+            self._print(error)
+
 
 def _cells_match(x: t.Any, y: t.Any) -> bool:
     """Helper function to compare two cells and returns true if they're equal, handling array objects."""
+    import pandas as pd
+    import numpy as np
 
     # Convert array-like objects to list for consistent comparison
     def _normalize(val: t.Any) -> t.Any:
@@ -2763,9 +2969,11 @@ class NotebookMagicConsole(TerminalConsole):
         )
         self.display(radio)
 
-    def log_test_results(
-        self, result: unittest.result.TestResult, output: t.Optional[str], target_dialect: str
-    ) -> None:
+    def log_test_results(self, result: ModelTextTestResult, target_dialect: str) -> None:
+        # We don't log the test results if no tests were ran
+        if not result.testsRun:
+            return
+
         import ipywidgets as widgets
 
         divider_length = 70
@@ -2774,6 +2982,11 @@ class NotebookMagicConsole(TerminalConsole):
             "font-weight": "bold",
             "font-family": "Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace",
         }
+
+        message = (
+            f"Ran {result.testsRun} tests against {target_dialect} in {result.duration} seconds."
+        )
+
         if result.wasSuccessful():
             success_color = {"color": "#008000"}
             header = str(h("span", {"style": shared_style}, "-" * divider_length))
@@ -2781,41 +2994,43 @@ class NotebookMagicConsole(TerminalConsole):
                 h(
                     "span",
                     {"style": {**shared_style, **success_color}},
-                    f"Successfully Ran {str(result.testsRun)} Tests Against {target_dialect}",
+                    f"Successfully {message}",
                 )
             )
             footer = str(h("span", {"style": shared_style}, "=" * divider_length))
             self.display(widgets.HTML("<br>".join([header, message, footer])))
         else:
+            output = self._captured_unit_test_results(result)
+
             fail_color = {"color": "#db3737"}
             fail_shared_style = {**shared_style, **fail_color}
             header = str(h("span", {"style": fail_shared_style}, "-" * divider_length))
             message = str(h("span", {"style": fail_shared_style}, "Test Failure Summary"))
-            num_success = str(
-                h(
-                    "span",
-                    {"style": fail_shared_style},
-                    f"Num Successful Tests: {result.testsRun - len(result.failures) - len(result.errors)}",
+            failed_tests = [
+                str(
+                    h(
+                        "span",
+                        {"style": fail_shared_style},
+                        f"Failed tests ({len(result.failures) + len(result.errors)}):",
+                    )
                 )
-            )
-            failure_tests = []
+            ]
+
             for test, _ in result.failures + result.errors:
                 if isinstance(test, ModelTest):
-                    failure_tests.append(
+                    failed_tests.append(
                         str(
                             h(
                                 "span",
                                 {"style": fail_shared_style},
-                                f"Failure Test: {test.model.name} {test.test_name}",
+                                f" • {test.model.name}::{test.test_name}",
                             )
                         )
                     )
-            failures = "<br>".join(failure_tests)
+            failures = "<br>".join(failed_tests)
             footer = str(h("span", {"style": fail_shared_style}, "=" * divider_length))
             error_output = widgets.Textarea(output, layout={"height": "300px", "width": "100%"})
-            test_info = widgets.HTML(
-                "<br>".join([header, message, footer, num_success, failures, footer])
-            )
+            test_info = widgets.HTML("<br>".join([header, message, footer, failures, footer]))
             self.display(widgets.VBox(children=[test_info, error_output], layout={"width": "100%"}))
 
 
@@ -3137,21 +3352,26 @@ class MarkdownConsole(CaptureTerminalConsole):
     def log_success(self, message: str) -> None:
         self._print(message)
 
-    def log_test_results(
-        self, result: unittest.result.TestResult, output: t.Optional[str], target_dialect: str
-    ) -> None:
+    def log_test_results(self, result: ModelTextTestResult, target_dialect: str) -> None:
+        # We don't log the test results if no tests were ran
+        if not result.testsRun:
+            return
+
+        message = f"Ran `{result.testsRun}` Tests Against `{target_dialect}`"
+
         if result.wasSuccessful():
-            self._print(
-                f"**Successfully Ran `{str(result.testsRun)}` Tests Against `{target_dialect}`**\n\n"
-            )
+            self._print(f"**Successfully {message}**\n\n")
         else:
-            self._print(
-                f"**Num Successful Tests: {result.testsRun - len(result.failures) - len(result.errors)}**\n\n"
-            )
+            self._print("```")
+            self._log_test_details(result, unittest_char_separator=False)
+            self._print("```\n\n")
+
+            failures = len(result.failures) + len(result.errors)
+            self._print(f"**{message}**\n")
+            self._print(f"**Failed tests ({failures}):**")
             for test, _ in result.failures + result.errors:
                 if isinstance(test, ModelTest):
-                    self._print(f"* Failure Test: `{test.model.name}` - `{test.test_name}`\n\n")
-            self._print(f"```{output}```\n\n")
+                    self._print(f" • `{test.model.name}`::`{test.test_name}`\n\n")
 
     def log_skipped_models(self, snapshot_names: t.Set[str]) -> None:
         if snapshot_names:
@@ -3184,6 +3404,12 @@ class MarkdownConsole(CaptureTerminalConsole):
 
     def log_warning(self, short_message: str, long_message: t.Optional[str] = None) -> None:
         logger.warning(long_message or short_message)
+
+        if not short_message.endswith("\n"):
+            short_message += (
+                "\n"  # so that the closing ``` ends up on a newline which is important for GitHub
+            )
+
         self._print(f"```\n\\[WARNING] {short_message}```\n\n")
 
     def _print(self, value: t.Any, **kwargs: t.Any) -> None:
@@ -3524,9 +3750,7 @@ class DebuggerTerminalConsole(TerminalConsole):
         for modified in context_diff.modified_snapshots:
             self._write(f"  Modified: {modified}")
 
-    def log_test_results(
-        self, result: unittest.result.TestResult, output: t.Optional[str], target_dialect: str
-    ) -> None:
+    def log_test_results(self, result: ModelTextTestResult, target_dialect: str) -> None:
         self._write("Test Results:", result)
 
     def show_sql(self, sql: str) -> None:
@@ -3725,19 +3949,34 @@ def _format_audits_errors(error: NodeAuditsErrors) -> str:
     return "  " + "\n".join(error_messages)
 
 
+def _format_interval(snapshot: Snapshot, interval: Interval) -> str:
+    """Format an interval with an optional prefix."""
+    inclusive_interval = make_inclusive(interval[0], interval[1])
+    if snapshot.model.interval_unit.is_date_granularity:
+        return f"{to_ds(inclusive_interval[0])} - {to_ds(inclusive_interval[1])}"
+
+    if inclusive_interval[0].date() == inclusive_interval[1].date():
+        # omit end date if interval start/end on same day
+        return f"{to_ds(inclusive_interval[0])} {inclusive_interval[0].strftime('%H:%M:%S')}-{inclusive_interval[1].strftime('%H:%M:%S')}"
+
+    return f"{inclusive_interval[0].strftime('%Y-%m-%d %H:%M:%S')} - {inclusive_interval[1].strftime('%Y-%m-%d %H:%M:%S')}"
+
+
+def _format_signal_interval(snapshot: Snapshot, interval: Interval) -> str:
+    """Format an interval for signal output (without 'insert' prefix)."""
+    return _format_interval(snapshot, interval)
+
+
 def _format_evaluation_model_interval(snapshot: Snapshot, interval: Interval) -> str:
+    """Format an interval for evaluation output (with 'insert' prefix)."""
     if snapshot.is_model and (
         snapshot.model.kind.is_incremental
         or snapshot.model.kind.is_managed
         or snapshot.model.kind.is_custom
     ):
-        inclusive_interval = make_inclusive(interval[0], interval[1])
-        if snapshot.model.interval_unit.is_date_granularity:
-            return f"insert {to_ds(inclusive_interval[0])} - {to_ds(inclusive_interval[1])}"
-        # omit end date if interval start/end on same day
-        if inclusive_interval[0].date() == inclusive_interval[1].date():
-            return f"insert {to_ds(inclusive_interval[0])} {inclusive_interval[0].strftime('%H:%M:%S')}-{inclusive_interval[1].strftime('%H:%M:%S')}"
-        return f"insert {inclusive_interval[0].strftime('%Y-%m-%d %H:%M:%S')} - {inclusive_interval[1].strftime('%Y-%m-%d %H:%M:%S')}"
+        formatted_interval = _format_interval(snapshot, interval)
+        return f"insert {formatted_interval}"
+
     return ""
 
 

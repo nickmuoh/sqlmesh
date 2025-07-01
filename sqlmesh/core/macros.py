@@ -1452,6 +1452,26 @@ def _coerce(
         if base is SQL and isinstance(expr, exp.Expression):
             return expr.sql(dialect)
 
+        if base is t.Literal:
+            if not isinstance(expr, (exp.Literal, exp.Boolean)):
+                raise SQLMeshError(
+                    f"{base_err_msg} Coercion to {base} requires a literal expression."
+                )
+            literal_type_args = t.get_args(typ)
+            try:
+                for literal_type_arg in literal_type_args:
+                    expr_is_bool = isinstance(expr.this, bool)
+                    literal_is_bool = isinstance(literal_type_arg, bool)
+                    if (expr_is_bool and literal_is_bool and literal_type_arg == expr.this) or (
+                        not expr_is_bool
+                        and not literal_is_bool
+                        and str(literal_type_arg) == str(expr.this)
+                    ):
+                        return type(literal_type_arg)(expr.this)
+            except Exception:
+                raise SQLMeshError(base_err_msg)
+            raise SQLMeshError(base_err_msg)
+
         if isinstance(expr, base):
             return expr
         if issubclass(base, exp.Expression):
@@ -1538,6 +1558,6 @@ def _convert_sql(v: t.Any, dialect: DialectType) -> t.Any:
     return v
 
 
-@lru_cache(maxsize=1028)
+@lru_cache(maxsize=16384)
 def _cache_convert_sql(v: t.Any, dialect: DialectType, t: type) -> t.Any:
     return _convert_sql(v, dialect)

@@ -94,6 +94,9 @@ jobs:
           name: Run linters and code style checks
           command: make py-style
       - run:
+          name: Exercise the benchmarks
+          command: make benchmark-ci
+      - run:
           name: Run cicd tests
           command: make cicd-test
       - store_test_results:
@@ -149,7 +152,6 @@ jobs:
       - image: cimg/node:20.19.0
     resource_class: small
     steps:
-      - halt_unless_client
       - checkout
       - restore_cache:
           name: Restore pnpm Package Cache
@@ -304,6 +306,7 @@ workflows:
                 - "3.10"
                 - "3.11"
                 - "3.12"
+                - "3.13"
       - cicd_tests_windows
       - engine_tests_docker:
           name: engine_<< matrix.engine >>

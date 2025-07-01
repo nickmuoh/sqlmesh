@@ -10,7 +10,6 @@ from difflib import unified_diff
 from enum import Enum, auto
 from functools import lru_cache
 
-import pandas as pd
 from sqlglot import Dialect, Generator, ParseError, Parser, Tokenizer, TokenType, exp
 from sqlglot.dialects.dialect import DialectType
 from sqlglot.dialects import DuckDB, Snowflake
@@ -27,6 +26,8 @@ from sqlmesh.utils.errors import SQLMeshError, ConfigError
 from sqlmesh.utils.pandas import columns_to_types_from_df
 
 if t.TYPE_CHECKING:
+    import pandas as pd
+
     from sqlglot._typing import E
 
 
@@ -345,12 +346,14 @@ def _parse_select(
     table: bool = False,
     parse_subquery_alias: bool = True,
     parse_set_operation: bool = True,
+    consume_pipe: bool = True,
 ) -> t.Optional[exp.Expression]:
     select = self.__parse_select(  # type: ignore
         nested=nested,
         table=table,
         parse_subquery_alias=parse_subquery_alias,
         parse_set_operation=parse_set_operation,
+        consume_pipe=consume_pipe,
     )
 
     if (
@@ -875,7 +878,7 @@ def parse(
     match = match_dialect and DIALECT_PATTERN.search(sql[:MAX_MODEL_DEFINITION_SIZE])
     dialect = Dialect.get_or_raise(match.group(2) if match else default_dialect)
 
-    tokens = dialect.tokenizer.tokenize(sql)
+    tokens = dialect.tokenize(sql)
     chunks: t.List[t.Tuple[t.List[Token], ChunkType]] = [([], ChunkType.SQL)]
     total = len(tokens)
 
@@ -1172,7 +1175,7 @@ def set_default_catalog(
     return table
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=16384)
 def normalize_model_name(
     table: str | exp.Table | exp.Column,
     default_catalog: t.Optional[str],
