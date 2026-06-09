@@ -1453,10 +1453,7 @@ def call_macro(
     bound = sig.bind(*provided_args, **provided_kwargs)
     bound.apply_defaults()
 
-    try:
-        annotations = t.get_type_hints(func, localns=get_supported_types())
-    except (NameError, TypeError):  # forward references aren't handled
-        annotations = {}
+    annotations = _resolve_macro_annotations(func)
 
     # If the macro is annotated, we try coerce the actual parameters to the corresponding types
     if annotations:
@@ -1476,6 +1473,21 @@ def call_macro(
                 bound.arguments[arg] = _coerce(value, typ, dialect, path)
 
     return func(*bound.args, **bound.kwargs)
+
+
+def _resolve_macro_annotations(func: t.Callable) -> t.Dict[str, t.Any]:
+    annotations: t.Dict[str, t.Any] = {}
+    namespace = {**get_supported_types(), **func.__globals__}
+
+    for name, annotation in inspect.get_annotations(func, eval_str=False).items():
+        try:
+            if isinstance(annotation, str):
+                annotation = eval(annotation, namespace)
+            annotations[name] = annotation
+        except Exception:
+            continue
+
+    return annotations
 
 
 def _coerce(

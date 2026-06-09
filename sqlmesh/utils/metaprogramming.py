@@ -93,11 +93,31 @@ def func_globals(func: t.Callable) -> t.Dict[str, t.Any]:
 
         func_args = next(node for node in ast.walk(root_node) if isinstance(node, ast.arguments))
         arg_defaults = (d for d in func_args.defaults + func_args.kw_defaults if d is not None)
+        arg_annotations = (
+            arg.annotation
+            for arg in (
+                func_args.posonlyargs
+                + func_args.args
+                + func_args.kwonlyargs
+                + ([func_args.vararg] if func_args.vararg else [])
+                + ([func_args.kwarg] if func_args.kwarg else [])
+            )
+            if arg and arg.annotation is not None
+        )
+        return_annotation = ()
+        func_def = next(
+            node for node in ast.walk(root_node) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        if func_def.returns is not None:
+            return_annotation = (func_def.returns,)
 
         # ast.Name corresponds to variable references, such as foo or x.foo. The former is
         # represented as Name(id=foo), and the latter as Attribute(value=Name(id=x) attr=foo)
         arg_globals = [
-            n.id for default in arg_defaults for n in ast.walk(default) if isinstance(n, ast.Name)
+            n.id
+            for default in chain(arg_defaults, arg_annotations, return_annotation)
+            for n in ast.walk(default)
+            if isinstance(n, ast.Name)
         ]
 
         code = func.__code__
