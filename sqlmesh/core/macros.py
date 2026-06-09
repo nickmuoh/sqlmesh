@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import inspect
 import sys
 import types
@@ -1482,12 +1483,36 @@ def _resolve_macro_annotations(func: t.Callable) -> t.Dict[str, t.Any]:
     for name, annotation in inspect.get_annotations(func, eval_str=False).items():
         try:
             if isinstance(annotation, str):
-                annotation = eval(annotation, namespace)
+                annotation = _eval_macro_annotation(annotation, namespace)
             annotations[name] = annotation
-        except Exception:
+        except (AttributeError, NameError, SyntaxError, TypeError, ValueError):
             continue
 
     return annotations
+
+
+def _eval_macro_annotation(annotation: str, namespace: t.Dict[str, t.Any]) -> t.Any:
+    expr = ast.parse(annotation, mode="eval")
+
+    for node in ast.walk(expr):
+        if not isinstance(
+            node,
+            (
+                ast.Expression,
+                ast.Attribute,
+                ast.BinOp,
+                ast.Constant,
+                ast.List,
+                ast.Load,
+                ast.Name,
+                ast.Subscript,
+                ast.Tuple,
+                ast.BitOr,
+            ),
+        ):
+            raise ValueError(f"Unsupported annotation expression: {annotation}")
+
+    return eval(compile(expr, "<sqlmesh annotation>", "eval"), namespace)
 
 
 def _coerce(

@@ -114,7 +114,7 @@ def macro_evaluator() -> MacroEvaluator:
     )
 
 
-def _load_alias_macro_module(tmp_path: Path):
+def load_alias_macro_module(tmp_path: Path):
     module_path = tmp_path / "macro_alias_module.py"
     module_path.write_text(
         textwrap.dedent(
@@ -153,7 +153,7 @@ def _load_alias_macro_module(tmp_path: Path):
                 evaluator: MacroEvaluator,
                 good_value: str,
                 fallback_value: SQLType,
-                unresolved_value: MissingAlias,
+                intentionally_unresolved: MissingAlias,
             ) -> SQLType:
                 assert isinstance(good_value, str)
                 assert isinstance(fallback_value, str)
@@ -285,7 +285,7 @@ def test_case(macro_evaluator: MacroEvaluator) -> None:
 
 
 def test_macro_type_annotation_aliases(assert_exp_eq, tmp_path: Path) -> None:
-    module, module_name = _load_alias_macro_module(tmp_path)
+    module, module_name = load_alias_macro_module(tmp_path)
     env: dict[str, t.Any] = {}
 
     try:
