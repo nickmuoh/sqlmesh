@@ -66,13 +66,18 @@ def test_read_returns_independent_batches():
     seed = Seed(content=content)
     seed_reader = seed.reader()
 
+    # Keep the generator open so the copy_on_write context inside read() stays active.
     gen = seed_reader.read(batch_size=1)
     first_batch = next(gen)
-    first_batch.at[0, "value"] = "changed"  # mutate while generator (and CoW context) is still open
+    # Mutate while the generator (and therefore the CoW context) is still open.
+    # CoW ensures only first_batch gets a private copy; the cached _df is unchanged.
+    first_batch.at[0, "value"] = "changed"
+    # second_batch is fetched while CoW is still active, so it still sees the original data.
     second_batch = next(gen)
 
     assert first_batch["value"].tolist() == ["changed"]
     assert second_batch["value"].tolist() == ["two"]
+    # CoW prevented the mutation from reaching the cached _df, so a fresh read returns original data.
     assert next(seed_reader.read())["value"].tolist() == ["one", "two"]
 
 
