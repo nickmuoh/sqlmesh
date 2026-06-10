@@ -1,15 +1,21 @@
 import typing as t
 from datetime import datetime, date
+import importlib.util
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 from sqlglot import MappingSchema, ParseError, exp, parse_one
 
+from sqlmesh import SQL as SQLType
 from sqlmesh.core import constants as c, dialect as d
 from sqlmesh.core.dialect import StagedFilePath
 from sqlmesh.core.macros import SQL, MacroEvalError, MacroEvaluator, macro
 from sqlmesh.utils.date import to_datetime, to_date
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.metaprogramming import Executable
+from sqlmesh.utils.metaprogramming import build_env, serialize_env
 from sqlmesh.core.macros import RuntimeStage
 
 
@@ -106,6 +112,64 @@ def macro_evaluator() -> MacroEvaluator:
         "hive",
         {"test": Executable(name="test", payload="def test(_):\n    return 'test'")},
     )
+
+
+def load_alias_macro_module(tmp_path: Path):
+    module_path = tmp_path / "macro_alias_module.py"
+    module_path.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            from sqlmesh import SQL as SQLType, macro
+            from sqlmesh.core.macros import MacroEvaluator, SQL
+
+            @macro()
+            def plain_sql_macro(
+                evaluator: MacroEvaluator,
+                driver_property: str,
+                property_name: str,
+                fallback_value: SQL,
+            ) -> SQL:
+                assert isinstance(driver_property, str)
+                assert isinstance(property_name, str)
+                assert isinstance(fallback_value, str)
+                return fallback_value
+
+            @macro()
+            def alias_sql_macro(
+                evaluator: MacroEvaluator,
+                driver_property: str,
+                property_name: str,
+                fallback_value: SQLType,
+            ) -> SQLType:
+                assert isinstance(driver_property, str)
+                assert isinstance(property_name, str)
+                assert isinstance(fallback_value, str)
+                return fallback_value
+
+            @macro()
+            def partial_resolution_macro(
+                evaluator: MacroEvaluator,
+                good_value: str,
+                fallback_value: SQLType,
+                intentionally_unresolved: MissingAlias,
+            ) -> SQLType:
+                assert isinstance(good_value, str)
+                assert isinstance(fallback_value, str)
+                return fallback_value
+            """
+        )
+    )
+
+    spec = importlib.util.spec_from_file_location("macro_alias_module", module_path)
+    assert spec and spec.loader
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    return module, spec.name
 
 
 def test_star(assert_exp_eq) -> None:
@@ -218,6 +282,52 @@ def test_start_no_column_types(assert_exp_eq) -> None:
 
 def test_case(macro_evaluator: MacroEvaluator) -> None:
     assert macro.get_registry()["upper"]
+
+
+def test_macro_type_annotation_aliases(assert_exp_eq, tmp_path: Path) -> None:
+    module, module_name = load_alias_macro_module(tmp_path)
+    env: dict[str, t.Any] = {}
+
+    try:
+        for macro_name in ("plain_sql_macro", "alias_sql_macro", "partial_resolution_macro"):
+            build_env(getattr(module, macro_name), env=env, name=macro_name, path=tmp_path)
+
+        evaluator = MacroEvaluator("hive", python_env=serialize_env(env, path=tmp_path))
+
+        assert_exp_eq(
+            evaluator.transform(
+                parse_one(
+                    "SELECT @plain_sql_macro('entitlement_sku', 'seat_id', es.seat_id) FROM foo es",
+                    read="hive",
+                )
+            ),
+            "SELECT es.seat_id FROM foo es",
+            dialect="hive",
+        )
+        assert_exp_eq(
+            evaluator.transform(
+                parse_one(
+                    "SELECT @alias_sql_macro('entitlement_sku', 'seat_id', es.seat_id) FROM foo es",
+                    read="hive",
+                )
+            ),
+            "SELECT es.seat_id FROM foo es",
+            dialect="hive",
+        )
+        assert_exp_eq(
+            evaluator.transform(
+                parse_one(
+                    "SELECT @partial_resolution_macro('entitlement_sku', 'seat_id', es.seat_id, 1) FROM foo es",
+                    read="hive",
+                )
+            ),
+            "SELECT es.seat_id FROM foo es",
+            dialect="hive",
+        )
+    finally:
+        for macro_name in ("plain_sql_macro", "alias_sql_macro", "partial_resolution_macro"):
+            macro.registry().pop(macro_name, None)
+        sys.modules.pop(module_name, None)
 
 
 def test_macro_var(macro_evaluator):

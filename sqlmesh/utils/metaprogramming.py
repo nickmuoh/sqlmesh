@@ -93,11 +93,15 @@ def func_globals(func: t.Callable) -> t.Dict[str, t.Any]:
 
         func_args = next(node for node in ast.walk(root_node) if isinstance(node, ast.arguments))
         arg_defaults = (d for d in func_args.defaults + func_args.kw_defaults if d is not None)
+        arg_annotations = _function_annotations(root_node)
 
         # ast.Name corresponds to variable references, such as foo or x.foo. The former is
         # represented as Name(id=foo), and the latter as Attribute(value=Name(id=x) attr=foo)
         arg_globals = [
-            n.id for default in arg_defaults for n in ast.walk(default) if isinstance(n, ast.Name)
+            n.id
+            for default in chain(arg_defaults, arg_annotations)
+            for n in ast.walk(default)
+            if isinstance(n, ast.Name)
         ]
 
         code = func.__code__
@@ -112,6 +116,30 @@ def func_globals(func: t.Callable) -> t.Dict[str, t.Any]:
                 variables[var] = value.cell_contents
 
     return variables
+
+
+def _function_annotations(root_node: ast.Module) -> t.List[ast.expr]:
+    func_args = next(node for node in ast.walk(root_node) if isinstance(node, ast.arguments))
+    func_def = next(
+        node for node in ast.walk(root_node) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+
+    annotations = [
+        arg.annotation
+        for arg in (
+            func_args.posonlyargs
+            + func_args.args
+            + func_args.kwonlyargs
+            + ([func_args.vararg] if func_args.vararg else [])
+            + ([func_args.kwarg] if func_args.kwarg else [])
+        )
+        if arg and arg.annotation is not None
+    ]
+
+    if func_def.returns is not None:
+        annotations.append(func_def.returns)
+
+    return annotations
 
 
 class ClassFoundException(Exception):

@@ -13,6 +13,7 @@ from sqlglot import exp
 from sqlglot import exp as expressions
 from sqlglot.expressions import SQLGLOT_META, to_table
 from sqlglot.optimizer.pushdown_projections import SELECT_ALL
+from sqlmesh import SQL as SQLType
 
 import tests.utils.test_date as test_date
 from sqlmesh.core.dialect import normalize_model_name
@@ -178,6 +179,10 @@ def macro2() -> str:
     return "2"
 
 
+def annotation_alias_func(value: str, fallback_value: SQLType) -> SQLType:
+    return fallback_value
+
+
 def test_func_globals() -> None:
     assert func_globals(main_func) == {
         "Y": 2,
@@ -194,6 +199,7 @@ def test_func_globals() -> None:
         "function_with_custom_decorator": function_with_custom_decorator,
         "SQLGLOT_META": SQLGLOT_META,
     }
+    assert func_globals(annotation_alias_func) == {"SQLType": SQLType}
     assert func_globals(other_func) == {
         "X": 1,
         "W": 0,
