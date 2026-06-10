@@ -66,10 +66,13 @@ def test_read_returns_independent_batches():
     seed = Seed(content=content)
     seed_reader = seed.reader()
 
-    batches = list(seed_reader.read(batch_size=1))
-    batches[0].at[0, "value"] = "changed"
+    gen = seed_reader.read(batch_size=1)
+    first_batch = next(gen)
+    first_batch.at[0, "value"] = "changed"  # mutate while generator (and CoW context) is still open
+    second_batch = next(gen)
 
-    assert [df["value"].tolist() for df in batches] == [["changed"], ["two"]]
+    assert first_batch["value"].tolist() == ["changed"]
+    assert second_batch["value"].tolist() == ["two"]
     assert next(seed_reader.read())["value"].tolist() == ["one", "two"]
 
 

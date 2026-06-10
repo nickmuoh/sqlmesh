@@ -108,13 +108,16 @@ class CsvSeedReader:
         }
 
     def read(self, batch_size: t.Optional[int] = None) -> t.Generator[pd.DataFrame, None, None]:
+        import pandas as pd
+
         df = self._get_df()
 
         batch_size = batch_size or df.size
         batch_start = 0
-        while batch_start < df.shape[0]:
-            yield df.iloc[batch_start : batch_start + batch_size, :].copy()
-            batch_start += batch_size
+        with pd.option_context("mode.copy_on_write", True):
+            while batch_start < df.shape[0]:
+                yield df.iloc[batch_start : batch_start + batch_size, :]
+                batch_start += batch_size
 
     def _get_df(self) -> pd.DataFrame:
         import pandas as pd
